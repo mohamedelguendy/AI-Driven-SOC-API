@@ -1,18 +1,18 @@
 from datetime import datetime, timedelta, timezone
 from ipaddress import ip_address, ip_network
- 
+
 from fastapi import APIRouter, Depends, Header, HTTPException
 from psycopg.types.json import Jsonb
- 
+
 from .. import adapters
 from ..config import settings
 from ..db import pool
 from ..deps import get_current_user, require_roles
 from ..schemas import DecisionIn, RecommendationIn
- 
+
 router = APIRouter(prefix="/recommendations", tags=["recommendations"])
- 
- 
+
+
 def _check_ai_key(x_api_key: str | None = Header(default=None)):
     """Separate machine credential for the AI SOC Engineer. Kept apart from
     the SIEM ingest key and from user logins — three different callers,
@@ -20,8 +20,8 @@ def _check_ai_key(x_api_key: str | None = Header(default=None)):
     """
     if x_api_key != settings.ai_api_key:
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
- 
- 
+
+
 def _looks_internal(target_value: str) -> bool:
     """Best-effort guess at whether a target is on the internal network.
     Used only as one input to impact classification below; when in doubt
@@ -32,8 +32,8 @@ def _looks_internal(target_value: str) -> bool:
         return net.is_private
     except ValueError:
         return False  # not an IP (e.g. a hostname) — can't tell, don't guess
- 
- 
+
+
 def determine_impact(conn, action_type: str, target_scope: str, is_internal: bool, is_permanent: bool) -> str:
     """The backend assigns impact — never trusts the AI's own labeling.
     Every matching rule is considered; the highest impact found wins.
@@ -49,12 +49,12 @@ def determine_impact(conn, action_type: str, target_scope: str, is_internal: boo
         """,
         (action_type, target_scope, is_internal, is_permanent),
     ).fetchall()
- 
+
     if not rules:
         return "high"
     return "high" if any(r["impact"] == "high" for r in rules) else "low"
- 
- 
+
+
 def _is_protected(conn, target_value: str) -> bool:
     """True if the target falls inside the protected allowlist. Blocks
     execution for every role, no exceptions.
@@ -63,37 +63,58 @@ def _is_protected(conn, target_value: str) -> bool:
         ip_address(target_value.split("/")[0])
     except ValueError:
         return False  # not an IP target (e.g. isolate_host by hostname) — allowlist doesn't apply
- 
+
     row = conn.execute(
         "SELECT 1 FROM protected_targets WHERE %s::inet <<= target LIMIT 1",
         (target_value,),
     ).fetchone()
     return row is not None
- 
- 
+
+
+def _find_active_action(conn, target_value: str, action_type: str, executor: str):
+    """An 'active' action: it succeeded, hasn't been reverted, and hasn't
+    expired. Used to avoid double-blocking the same target — approving a
+    second recommendation for something already blocked should be a safe
+    no-op, not a duplicate rule or a crash.
+    """
+    return conn.execute(
+        """
+        SELECT a.id, a.result_message FROM actions a
+        JOIN recommendations r ON r.id = a.recommendation_id
+        WHERE r.target_value = %s AND r.action_type = %s AND a.executor = %s
+          AND a.success = TRUE
+          AND a.reverted_at IS NULL
+          AND (a.expires_at IS NULL OR a.expires_at > now())
+        ORDER BY a.executed_at DESC
+        LIMIT 1
+        """,
+        (target_value, action_type, executor),
+    ).fetchone()
+
+
 @router.post("", dependencies=[Depends(_check_ai_key)])
 def create_recommendation(rec: RecommendationIn):
     """The AI submits a recommendation. It is stored as pending and
     NEVER executed here — a human always decides.
     """
     is_internal = _looks_internal(rec.target_value)
- 
+
     with pool.connection() as conn:
         impact = determine_impact(
             conn, rec.action_type, rec.target_scope, is_internal, rec.is_permanent
         )
- 
+
         if not rec.is_permanent and rec.duration_secs is None:
             raise HTTPException(
                 status_code=422, detail="duration_secs is required for non-permanent actions"
             )
- 
+
         incident = conn.execute(
             "SELECT id FROM incidents WHERE id = %s", (rec.incident_id,)
         ).fetchone()
         if incident is None:
             raise HTTPException(status_code=404, detail="Incident not found")
- 
+
         row = conn.execute(
             """
             INSERT INTO recommendations
@@ -116,7 +137,7 @@ def create_recommendation(rec: RecommendationIn):
                 impact,
             ),
         ).fetchone()
- 
+
         conn.execute(
             """
             INSERT INTO audit_log (actor_type, event_type, entity_type, entity_id, details)
@@ -124,10 +145,10 @@ def create_recommendation(rec: RecommendationIn):
             """,
             (row["id"], Jsonb({"impact": impact, "action_type": rec.action_type})),
         )
- 
+
     return row
- 
- 
+
+
 @router.get("")
 def list_recommendations(status: str | None = None, user: dict = Depends(get_current_user)):
     query = "SELECT * FROM recommendations"
@@ -136,12 +157,12 @@ def list_recommendations(status: str | None = None, user: dict = Depends(get_cur
         query += " WHERE status = %s"
         params = (status,)
     query += " ORDER BY created_at DESC"
- 
+
     with pool.connection() as conn:
         rows = conn.execute(query, params).fetchall()
     return rows
- 
- 
+
+
 @router.post("/{rec_id}/approve")
 def approve(
     rec_id: int,
@@ -156,20 +177,20 @@ def approve(
             raise HTTPException(status_code=404, detail="Recommendation not found")
         if rec["status"] != "pending":
             raise HTTPException(status_code=409, detail=f"Already {rec['status']}")
- 
+
         # The core rule: tier2 can approve low-impact only, tier3/admin can approve any.
         if rec["impact"] == "high" and user["role"] not in ("tier3", "admin"):
             raise HTTPException(
                 status_code=403,
                 detail="High-impact actions require tier3. Escalate the incident instead.",
             )
- 
+
         if _is_protected(conn, rec["target_value"]):
             raise HTTPException(
                 status_code=403,
                 detail="Target is on the protected allowlist and cannot be acted on",
             )
- 
+
         conn.execute(
             """
             UPDATE recommendations
@@ -185,22 +206,34 @@ def approve(
             """,
             (user["id"], rec_id, Jsonb({"comment": decision.comment})),
         )
- 
-        # --- Execute ---
-        # Routed through app/adapters: firewall.py or edr.py depending on
-        # rec["executor"]. Both simulate for now; see those files for how
-        # to plug in the real integration once access details are shared.
-        command = {
-            "action_type": rec["action_type"],
-            "target": rec["target_value"],
-            "executor": rec["executor"],
-        }
-        success, result_message = adapters.execute(rec["executor"], command)
- 
+
+        # --- Duplicate check ---
+        # If the same target already has this exact action in effect,
+        # don't send a second block/isolate — just record the attempt
+        # and point at it. Keeps a flood of AI recommendations for the
+        # same IP from piling up duplicate firewall rules.
+        existing = _find_active_action(conn, rec["target_value"], rec["action_type"], rec["executor"])
+
+        if existing:
+            success, result_message = True, f"Already active (action #{existing['id']}) — no new action taken"
+        else:
+            # --- Execute ---
+            # Routed through app/adapters: firewall.py or edr.py depending on
+            # rec["executor"]. Both simulate for now; see those files for how
+            # to plug in the real integration once access details are shared.
+            # adapters.execute() never raises — an adapter crash comes back
+            # as (False, "Adapter error: ..."), never a 500.
+            command = {
+                "action_type": rec["action_type"],
+                "target": rec["target_value"],
+                "executor": rec["executor"],
+            }
+            success, result_message = adapters.execute(rec["executor"], command)
+
         expires_at = None
         if not rec["is_permanent"] and rec["duration_secs"]:
             expires_at = datetime.now(timezone.utc) + timedelta(seconds=rec["duration_secs"])
- 
+
         action = conn.execute(
             """
             INSERT INTO actions
@@ -219,7 +252,7 @@ def approve(
                 expires_at,
             ),
         ).fetchone()
- 
+
         conn.execute(
             "UPDATE recommendations SET status = %s WHERE id = %s",
             ("executed" if success else "failed", rec_id),
@@ -236,10 +269,10 @@ def approve(
                 Jsonb(command),
             ),
         )
- 
+
     return {"recommendation_id": rec_id, "status": "executed" if success else "failed", "action": action}
- 
- 
+
+
 @router.post("/{rec_id}/reject")
 def reject(
     rec_id: int,
@@ -254,7 +287,7 @@ def reject(
             raise HTTPException(status_code=404, detail="Recommendation not found")
         if rec["status"] != "pending":
             raise HTTPException(status_code=409, detail=f"Already {rec['status']}")
- 
+
         conn.execute(
             """
             UPDATE recommendations
@@ -270,6 +303,5 @@ def reject(
             """,
             (user["id"], rec_id, Jsonb({"comment": decision.comment})),
         )
- 
+
     return {"recommendation_id": rec_id, "status": "rejected"}
- 
