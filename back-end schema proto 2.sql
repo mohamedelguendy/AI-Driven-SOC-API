@@ -6,7 +6,7 @@
 
 -- ---------- Enumerated types ----------
 
-CREATE TYPE user_role AS ENUM ('tier2', 'tier3', 'admin');
+CREATE TYPE user_role AS ENUM ('tier1', 'tier2', 'tier3', 'admin');
 
 CREATE TYPE alert_source AS ENUM ('siem', 'ids', 'edr', 'firewall', 'webapp');
 
@@ -53,7 +53,7 @@ CREATE TABLE incidents (
     status         incident_status NOT NULL DEFAULT 'new',
     severity       SMALLINT NOT NULL CHECK (severity BETWEEN 1 AND 5),
     risk_score     SMALLINT CHECK (risk_score BETWEEN 0 AND 100),
-    assigned_tier  user_role CHECK (assigned_tier IN ('tier2', 'tier3')),
+    assigned_tier  user_role CHECK (assigned_tier IN ('tier1', 'tier2', 'tier3')),
     assigned_to    BIGINT REFERENCES users(id),
     ai_summary     TEXT,                       -- AI explanation shown to analysts
     created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),

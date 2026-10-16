@@ -212,6 +212,11 @@ def approve(
         # don't send a second block/isolate — just record the attempt
         # and point at it. Keeps a flood of AI recommendations for the
         # same IP from piling up duplicate firewall rules.
+        command = {
+            "action_type": rec["action_type"],
+            "target": rec["target_value"],
+            "executor": rec["executor"],
+        }
         existing = _find_active_action(conn, rec["target_value"], rec["action_type"], rec["executor"])
 
         if existing:
@@ -223,11 +228,6 @@ def approve(
             # to plug in the real integration once access details are shared.
             # adapters.execute() never raises — an adapter crash comes back
             # as (False, "Adapter error: ..."), never a 500.
-            command = {
-                "action_type": rec["action_type"],
-                "target": rec["target_value"],
-                "executor": rec["executor"],
-            }
             success, result_message = adapters.execute(rec["executor"], command)
 
         expires_at = None

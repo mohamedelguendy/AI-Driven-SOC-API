@@ -11,7 +11,7 @@ from psycopg.errors import UniqueViolation
 from app.db import pool
 from app.security import hash_password
 
-ROLES = ("tier2", "tier3", "admin")
+ROLES = ("tier1", "tier2", "tier3", "admin")
 
 
 def main() -> None:

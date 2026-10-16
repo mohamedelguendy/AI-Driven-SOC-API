@@ -3,16 +3,16 @@ from psycopg.types.json import Jsonb
 
 from ..db import pool
 from ..deps import get_current_user, require_roles
-from ..schemas import NoteIn
+from ..schemas import NoteIn, TriageIn
 
 router = APIRouter(prefix="/incidents", tags=["incidents"])
 
 
 @router.get("")
 def list_incidents(status: str | None = None, user: dict = Depends(get_current_user)):
-    """The incident queue. No tier 1 exists, so this is the first screen
-    any analyst sees — ordered by risk so the most important incident is
-    always on top.
+    """The incident queue. Tier 1 triage happens first, then tier 2/tier 3
+    work the tracked incident. Incidents are ordered by risk so the most
+    important case is always surfaced first.
     """
     query = "SELECT * FROM incidents"
     params: tuple = ()
@@ -60,9 +60,79 @@ def get_incident(incident_id: int, user: dict = Depends(get_current_user)):
     }
 
 
+@router.post("/{incident_id}/triage")
+def triage_incident(
+    incident_id: int,
+    triage: TriageIn,
+    user: dict = Depends(require_roles("tier1", "tier2", "tier3", "admin")),
+):
+    """Tier 1 confirms whether an incident is real or a false positive."""
+    with pool.connection() as conn:
+        incident = conn.execute(
+            "SELECT * FROM incidents WHERE id = %s", (incident_id,)
+        ).fetchone()
+        if incident is None:
+            raise HTTPException(status_code=404, detail="Incident not found")
+        if incident["status"] not in ("new", "investigating"):
+            raise HTTPException(
+                status_code=409,
+                detail=f"Incident is already in status '{incident['status']}' and cannot be triaged again",
+            )
+
+        if triage.confirmed:
+            new_status = "investigating"
+            assigned_tier = "tier2"
+            summary = triage.reason or "Confirmed as a real incident by triage review"
+        else:
+            new_status = "closed"
+            assigned_tier = None
+            summary = triage.reason or "Dismissed as a false positive during triage"
+
+        row = conn.execute(
+            """
+            UPDATE incidents
+            SET status = %s,
+                assigned_tier = %s,
+                updated_at = now(),
+                resolved_at = CASE WHEN %s = 'closed' THEN now() ELSE resolved_at END
+            WHERE id = %s
+            RETURNING id, status, assigned_tier, updated_at
+            """,
+            (new_status, assigned_tier, new_status, incident_id),
+        ).fetchone()
+
+        conn.execute(
+            """
+            INSERT INTO incident_notes (incident_id, author_id, body)
+            VALUES (%s, %s, %s)
+            """,
+            (incident_id, user["id"], f"Triage verdict: {'confirmed' if triage.confirmed else 'dismissed'} - {summary}"),
+        )
+
+        conn.execute(
+            """
+            INSERT INTO audit_log (actor_type, actor_id, event_type, entity_type, entity_id, details)
+            VALUES ('user', %s, %s, 'incident', %s, %s)
+            """,
+            (
+                user["id"],
+                "incident.triaged_confirmed" if triage.confirmed else "incident.triaged_dismissed",
+                incident_id,
+                Jsonb({"confirmed": triage.confirmed, "reason": triage.reason}),
+            ),
+        )
+
+    return {
+        "incident_id": incident_id,
+        "status": row["status"],
+        "confirmed": triage.confirmed,
+        "reason": triage.reason,
+    }
+
+
 @router.post("/{incident_id}/notes")
 def add_note(
-    incident_id: int, note: NoteIn, user: dict = Depends(require_roles("tier2", "tier3", "admin"))
+    incident_id: int, note: NoteIn, user: dict = Depends(require_roles("tier1", "tier2", "tier3", "admin"))
 ):
     with pool.connection() as conn:
         incident = conn.execute(
