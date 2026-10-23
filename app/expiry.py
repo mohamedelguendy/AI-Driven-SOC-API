@@ -2,11 +2,10 @@
  
 Runs as a background thread (started in main.py's lifespan) so a
 temporary block doesn't require anyone to remember to undo it manually.
-A failed revert is logged and retried on the next cycle — it is never
-silently dropped, and expires_at is left untouched so it keeps trying.
+Expired actions are queued once; the action worker retries failures and
+records jobs that exhaust their retry limit for operator follow-up.
 """
 import threading
-import time
  
 from psycopg.types.json import Jsonb
 
@@ -26,6 +25,10 @@ def _revert_expired_once():
               AND a.expires_at IS NOT NULL
               AND a.expires_at <= now()
               AND a.success = TRUE
+              AND NOT EXISTS (
+                  SELECT 1 FROM action_jobs j
+                  WHERE j.action_id = a.id AND j.operation = 'revert'
+              )
             ORDER BY a.expires_at, a.id
             LIMIT 100
             ON CONFLICT (action_id, operation) DO NOTHING

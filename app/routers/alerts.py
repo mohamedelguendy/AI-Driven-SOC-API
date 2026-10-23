@@ -44,7 +44,10 @@ def _safe_time(value: str | None) -> tuple[datetime | None, str | None]:
     if not value:
         return None, None
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00")), None
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed, None
     except ValueError:
         return None, f'"{value}" is not a valid ISO timestamp'
 

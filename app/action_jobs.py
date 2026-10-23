@@ -1,6 +1,5 @@
 """Durable, retryable execution and reversal of approved response actions."""
 import threading
-import time
 
 from psycopg.types.json import Jsonb
 

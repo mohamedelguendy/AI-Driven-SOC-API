@@ -101,7 +101,8 @@ $env:TEST_DATABASE_URL = "postgresql://<db-user>:<db-password>@<db-host>:5432/so
 python -m unittest discover -s tests -v
 ```
 
-The tests are skipped when `TEST_DATABASE_URL` is not set.
+The tests are skipped when `TEST_DATABASE_URL` is not set. The login API
+limits an IP/username pair to 10 attempts per 15-minute window.
 
 ## Roles
 

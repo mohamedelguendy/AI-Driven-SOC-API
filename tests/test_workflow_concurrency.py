@@ -145,7 +145,9 @@ class IngestHelperTests(unittest.TestCase):
 
     def test_internal_target_uses_configured_rfc1918_networks(self):
         from app.routers.recommendations import _looks_internal
+        from app.db import pool
 
+        atexit.register(pool.close)
         self.assertTrue(_looks_internal("10.23.5.4"))
         self.assertTrue(_looks_internal("172.16.0.0/12"))
         self.assertTrue(_looks_internal("192.168.1.0/24"))

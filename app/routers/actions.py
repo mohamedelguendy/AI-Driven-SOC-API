@@ -31,18 +31,16 @@ def revert_action(
     decision: DecisionIn,
     user: dict = Depends(require_roles("tier2", "tier3", "admin")),
 ):
-    """Manually undo an action (e.g. a mistaken block). The automatic
-    expiry job (app/expiry.py) calls the same adapters.revert() — this
-    is the human-triggered path for everything else: mistakes, and
-    permanent actions that need to be lifted before they'd ever expire.
+    """Queue a manual reversal of an action (e.g. a mistaken block).
+    The background worker performs the same adapter reversal used for
+    actions queued by the automatic expiry job.
     """
     with pool.connection() as conn:
         action = conn.execute(
             """
-            SELECT a.*, r.action_type, r.target_value
-            FROM actions a JOIN recommendations r ON r.id = a.recommendation_id
-            WHERE a.id = %s
-            FOR UPDATE OF a
+            SELECT * FROM actions
+            WHERE id = %s
+            FOR UPDATE
             """,
             (action_id,),
         ).fetchone()
