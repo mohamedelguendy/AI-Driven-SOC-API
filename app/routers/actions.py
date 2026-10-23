@@ -53,15 +53,59 @@ def revert_action(
 
         job = conn.execute(
             """
-            INSERT INTO action_jobs (action_id, operation, requested_by)
-            VALUES (%s, 'revert', %s)
-            ON CONFLICT (action_id, operation) DO NOTHING
-            RETURNING id
+            SELECT id, status, last_error
+            FROM action_jobs
+            WHERE action_id = %s AND operation = 'revert'
+            FOR UPDATE
             """,
-            (action_id, user["id"]),
+            (action_id,),
         ).fetchone()
-        if job is None:
-            raise HTTPException(status_code=409, detail="A revert is already queued or has been attempted")
+        if job and job["status"] in ("queued", "running"):
+            raise HTTPException(status_code=409, detail="A revert is already queued or running")
+        if job and job["status"] == "succeeded":
+            raise HTTPException(status_code=409, detail="The revert job already succeeded")
+
+        if job and job["status"] == "failed":
+            retried_job = conn.execute(
+                """
+                UPDATE action_jobs
+                SET status = 'queued',
+                    attempts = 0,
+                    next_attempt_at = now(),
+                    claimed_at = NULL,
+                    claim_token = NULL,
+                    requested_by = %s,
+                    updated_at = now()
+                WHERE id = %s AND status = 'failed'
+                RETURNING id
+                """,
+                (user["id"], job["id"]),
+            ).fetchone()
+            if retried_job is None:
+                raise HTTPException(status_code=409, detail="Revert job state changed; retry the request")
+            job_id = retried_job["id"]
+            event_type = "action.revert_retry_queued"
+            details = {
+                "job_id": job_id,
+                "previous_error": job["last_error"],
+                "comment": decision.comment,
+            }
+        else:
+            queued_job = conn.execute(
+                """
+                INSERT INTO action_jobs (action_id, operation, requested_by)
+                VALUES (%s, 'revert', %s)
+                ON CONFLICT (action_id, operation) DO NOTHING
+                RETURNING id
+                """,
+                (action_id, user["id"]),
+            ).fetchone()
+            if queued_job is None:
+                raise HTTPException(status_code=409, detail="A revert is already queued or has been attempted")
+            job_id = queued_job["id"]
+            event_type = "action.revert_queued"
+            details = {"job_id": job_id, "comment": decision.comment}
+
         conn.execute(
             """
             INSERT INTO audit_log (actor_type, actor_id, event_type, entity_type, entity_id, details)
@@ -69,10 +113,10 @@ def revert_action(
             """,
             (
                 user["id"],
-                "action.revert_queued",
+                event_type,
                 action_id,
-                Jsonb({"job_id": job["id"], "comment": decision.comment}),
+                Jsonb(details),
             ),
         )
 
-    return {"action_id": action_id, "reverted": False, "status": "queued", "job_id": job["id"]}
+    return {"action_id": action_id, "reverted": False, "status": "queued", "job_id": job_id}

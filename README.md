@@ -81,6 +81,7 @@ back-end/
    Get-Content migration/005_action_jobs.sql | docker exec -i soc_db psql -U soc -d soc
    Get-Content migration/006_login_rate_limits.sql | docker exec -i soc_db psql -U soc -d soc
    Get-Content migration/007_alert_ingest_idempotency.sql | docker exec -i soc_db psql -U soc -d soc
+   Get-Content migration/008_action_job_leases.sql | docker exec -i soc_db psql -U soc -d soc
    ```
 8. **Create a user:**
    ```bash
@@ -124,8 +125,8 @@ limits an IP/username pair to 10 attempts per 15-minute window.
 | `GET /threat-intel/{ip}` | IP reputation (AbuseIPDB / VirusTotal), cached 1 hour |
 | `POST /recommendations` | AI submits a recommendation (needs `X-API-Key`: `AI_API_KEY`) |
 | `POST /analysis/validate-evidence` | Confirms an AI report's cited alert IDs are real |
-| `POST /recommendations/{id}/approve` | Tier2 (low-impact) / tier3 (any) approve and queue execution |
-| `POST /actions/{id}/revert` | Queue a manual action reversal |
+| `POST /recommendations/{id}/approve` | Tier2 (low-impact) / tier3 (any) approve and queue execution; identical pending actions return 409 |
+| `POST /actions/{id}/revert` | Queue a manual reversal or retry a failed reversal |
 | `GET /actions?active_only=true` | Successfully applied actions still in effect |
 
 ## Feeding real security tools into the pipeline
@@ -161,5 +162,7 @@ docstring in `ingest_ids_engine.py`.
 Firewall/EDR execution is currently simulated (logged, not sent to a real
 device) — pending access details from the security team. Approvals and
 reversions are durable queued jobs; the worker retries failures up to eight
-times with exponential backoff. A real executor must honor the stable
-idempotency key included in its command to prevent duplicated side effects.
+times with exponential backoff and renews its database lease while an adapter
+call is active. A failed reversal can be retried by calling the same revert
+endpoint again. A real executor must honor the stable idempotency key included
+in its command to prevent duplicated side effects.

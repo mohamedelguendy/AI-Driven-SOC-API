@@ -274,6 +274,7 @@ class WorkflowConcurrencyTests(unittest.TestCase):
                 "005_action_jobs.sql",
                 "006_login_rate_limits.sql",
                 "007_alert_ingest_idempotency.sql",
+                "008_action_job_leases.sql",
             ):
                 migration_path = migration_dir / migration_name
                 conn.execute(migration_path.read_text(encoding="utf-8"), prepare=False)
@@ -330,6 +331,7 @@ class WorkflowConcurrencyTests(unittest.TestCase):
             conn.execute(sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(cls.schema)))
 
     def setUp(self):
+        self.target_value = f"203.0.113.{uuid.uuid4().int % 254 + 1}"
         with self.test_pool.connection() as conn:
             user = conn.execute(
                 "INSERT INTO users (username, password_hash, role) "
@@ -342,18 +344,19 @@ class WorkflowConcurrencyTests(unittest.TestCase):
             self.user_id = user["id"]
             self.incident_id = incident["id"]
 
-    def _create_recommendation(self):
+    def _create_recommendation(self, target_value=None):
+        target_value = target_value or self.target_value
         with self.test_pool.connection() as conn:
             row = conn.execute(
                 """
                 INSERT INTO recommendations
                     (incident_id, action_type, executor, target_scope, target_value,
                      is_internal, is_permanent, duration_secs, reason, impact)
-                VALUES (%s, 'block_ip', 'firewall', 'single_ip', '203.0.113.7',
+                VALUES (%s, 'block_ip', 'firewall', 'single_ip', %s,
                         FALSE, FALSE, 60, 'Regression test', 'low')
                 RETURNING id
                 """,
-                (self.incident_id,),
+                (self.incident_id, target_value),
             ).fetchone()
         return row["id"]
 
@@ -698,6 +701,186 @@ class WorkflowConcurrencyTests(unittest.TestCase):
         self.assertEqual(job["status"], "succeeded")
         self.assertEqual(job["attempts"], 2)
         self.assertEqual(recommendation["status"], "executed")
+
+    def test_identical_approval_is_rejected_while_execution_is_pending(self):
+        target = self.target_value
+        first_recommendation_id = self._create_recommendation(target)
+        second_recommendation_id = self._create_recommendation(target)
+
+        first = self.recommendations.approve(
+            first_recommendation_id,
+            self.recommendations.DecisionIn(),
+            {"id": self.user_id, "role": "tier2"},
+        )
+        self.assertEqual(first["status"], "queued")
+
+        with self.assertRaises(HTTPException) as error:
+            self.recommendations.approve(
+                second_recommendation_id,
+                self.recommendations.DecisionIn(),
+                {"id": self.user_id, "role": "tier2"},
+            )
+        self.assertEqual(error.exception.status_code, 409)
+
+        with self.test_pool.connection() as conn:
+            count = conn.execute(
+                """
+                SELECT count(*) AS count
+                FROM actions a
+                JOIN recommendations r ON r.id = a.recommendation_id
+                JOIN action_jobs j ON j.action_id = a.id AND j.operation = 'execute'
+                WHERE r.target_value = %s
+                  AND j.status IN ('queued', 'running')
+                """,
+                (target,),
+            ).fetchone()["count"]
+            status = conn.execute(
+                "SELECT status FROM recommendations WHERE id = %s",
+                (second_recommendation_id,),
+            ).fetchone()["status"]
+
+        self.assertEqual(count, 1)
+        self.assertEqual(status, "pending")
+        with patch.object(
+            self.action_jobs.adapters,
+            "execute",
+            return_value=(True, "Test action completed"),
+        ):
+            self.assertTrue(self.action_jobs.process_one_job())
+
+    def test_approval_of_active_action_does_not_create_revertible_duplicate(self):
+        target = self.target_value
+        original_recommendation_id = self._create_recommendation(target)
+        original_response = self.recommendations.approve(
+            original_recommendation_id,
+            self.recommendations.DecisionIn(),
+            {"id": self.user_id, "role": "tier2"},
+        )
+        action_id = original_response["action"]["id"]
+        with patch.object(
+            self.action_jobs.adapters,
+            "execute",
+            return_value=(True, "Test action completed"),
+        ):
+            self.assertTrue(self.action_jobs.process_one_job())
+
+        duplicate_recommendation_id = self._create_recommendation(target)
+        duplicate_response = self.recommendations.approve(
+            duplicate_recommendation_id,
+            self.recommendations.DecisionIn(),
+            {"id": self.user_id, "role": "tier2"},
+        )
+
+        self.assertEqual(duplicate_response["status"], "already_active")
+        self.assertEqual(duplicate_response["action"]["id"], action_id)
+        with self.test_pool.connection() as conn:
+            action_count = conn.execute(
+                """
+                SELECT count(*) AS count
+                FROM actions a JOIN recommendations r ON r.id = a.recommendation_id
+                WHERE r.target_value = %s
+                """,
+                (target,),
+            ).fetchone()["count"]
+            duplicate_status = conn.execute(
+                "SELECT status FROM recommendations WHERE id = %s",
+                (duplicate_recommendation_id,),
+            ).fetchone()["status"]
+            conn.execute(
+                "UPDATE actions SET expires_at = now() - interval '1 minute' WHERE id = %s",
+                (action_id,),
+            )
+
+        self.assertEqual(action_count, 1)
+        self.assertEqual(duplicate_status, "executed")
+        self.expiry._revert_expired_once()
+        with self.test_pool.connection() as conn:
+            revert_jobs = conn.execute(
+                """
+                SELECT count(*) AS count FROM action_jobs
+                WHERE action_id = %s AND operation = 'revert'
+                """,
+                (action_id,),
+            ).fetchone()["count"]
+        self.assertEqual(revert_jobs, 1)
+        with patch.object(
+            self.action_jobs.adapters,
+            "revert",
+            return_value=(True, "Test revert completed"),
+        ):
+            self.assertTrue(self.action_jobs.process_one_job())
+
+    def test_failed_revert_can_be_retried_and_audited(self):
+        action_id = self._create_expired_action()
+        with self.test_pool.connection() as conn:
+            failed_job = conn.execute(
+                """
+                INSERT INTO action_jobs
+                    (action_id, operation, status, attempts, last_error)
+                VALUES (%s, 'revert', 'failed', 8, 'Adapter unavailable')
+                RETURNING id
+                """,
+                (action_id,),
+            ).fetchone()
+
+        response = self.actions.revert_action(
+            action_id,
+            self.actions.DecisionIn(comment="Retry after checking adapter"),
+            {"id": self.user_id, "role": "tier2"},
+        )
+        self.assertEqual(response["status"], "queued")
+        self.assertEqual(response["job_id"], failed_job["id"])
+
+        with patch.object(
+            self.action_jobs.adapters,
+            "revert",
+            return_value=(True, "Test revert completed"),
+        ):
+            self.assertTrue(self.action_jobs.process_one_job())
+
+        with self.test_pool.connection() as conn:
+            job = conn.execute(
+                "SELECT status, attempts FROM action_jobs WHERE id = %s",
+                (failed_job["id"],),
+            ).fetchone()
+            audit = conn.execute(
+                """
+                SELECT count(*) AS count FROM audit_log
+                WHERE entity_type = 'action' AND entity_id = %s
+                  AND event_type = 'action.revert_retry_queued'
+                """,
+                (action_id,),
+            ).fetchone()["count"]
+        self.assertEqual(job["status"], "succeeded")
+        self.assertEqual(job["attempts"], 1)
+        self.assertEqual(audit, 1)
+
+    def test_running_job_lease_is_renewed_while_adapter_is_active(self):
+        recommendation_id = self._create_recommendation()
+        self.recommendations.approve(
+            recommendation_id,
+            self.recommendations.DecisionIn(),
+            {"id": self.user_id, "role": "tier2"},
+        )
+        started = threading.Event()
+        finish = threading.Event()
+
+        def slow_execute(executor, command):
+            started.set()
+            if not finish.wait(timeout=5):
+                raise TimeoutError("Test adapter was not released")
+            return True, "Test action completed"
+
+        with patch.object(self.action_jobs, "LEASE_RENEW_INTERVAL_SECONDS", 0.01), patch.object(
+            self.action_jobs, "CLAIM_TIMEOUT_SECONDS", 0.04
+        ), patch.object(self.action_jobs.adapters, "execute", side_effect=slow_execute):
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                running = executor.submit(self.action_jobs.process_one_job)
+                self.assertTrue(started.wait(timeout=2))
+                threading.Event().wait(0.15)
+                self.assertFalse(self.action_jobs.process_one_job())
+                finish.set()
+                self.assertTrue(running.result(timeout=5))
 
     def _create_expired_action(self):
         recommendation_id = self._create_recommendation()

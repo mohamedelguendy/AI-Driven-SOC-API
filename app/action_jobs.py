@@ -1,5 +1,6 @@
 """Durable, retryable execution and reversal of approved response actions."""
 import threading
+import uuid
 
 from psycopg.types.json import Jsonb
 
@@ -9,9 +10,12 @@ from .db import pool
 CHECK_INTERVAL_SECONDS = 2
 MAX_ATTEMPTS = 8
 CLAIM_TIMEOUT_SECONDS = 120
+LEASE_RENEW_INTERVAL_SECONDS = 30
 
 
 def _claim_job():
+    """Atomically claim one ready job or reclaim one with an expired lease."""
+    claim_token = uuid.uuid4()
     with pool.connection() as conn:
         return conn.execute(
             """
@@ -19,6 +23,7 @@ def _claim_job():
             SET status = 'running',
                 attempts = attempts + 1,
                 claimed_at = now(),
+                claim_token = %s,
                 updated_at = now()
             WHERE id = (
                 SELECT id
@@ -34,10 +39,33 @@ def _claim_job():
                 FOR UPDATE SKIP LOCKED
                 LIMIT 1
             )
-            RETURNING id, action_id, operation, attempts, requested_by
+            RETURNING id, action_id, operation, attempts, requested_by, claim_token
             """,
-            (CLAIM_TIMEOUT_SECONDS,),
+            (claim_token, CLAIM_TIMEOUT_SECONDS),
         ).fetchone()
+
+
+def _renew_lease(
+    job: dict,
+    stop_event: threading.Event,
+    lease_lost: threading.Event,
+) -> None:
+    while not stop_event.wait(LEASE_RENEW_INTERVAL_SECONDS):
+        try:
+            with pool.connection() as conn:
+                result = conn.execute(
+                    """
+                    UPDATE action_jobs
+                    SET claimed_at = now(), updated_at = now()
+                    WHERE id = %s AND status = 'running' AND claim_token = %s
+                    """,
+                    (job["id"], job["claim_token"]),
+                )
+            if result.rowcount != 1:
+                lease_lost.set()
+                return
+        except Exception as error:
+            print(f"[action-jobs] lease renewal failed for job {job['id']}: {error}")
 
 
 def _job_command(job: dict) -> tuple[str, dict]:
@@ -72,6 +100,34 @@ def _finish_job(job: dict, success: bool, message: str) -> None:
     delay_seconds = min(2 ** job["attempts"], 300)
 
     with pool.connection() as conn:
+        status = "queued" if retry else ("succeeded" if success else "failed")
+        result = conn.execute(
+            """
+            UPDATE action_jobs
+            SET status = %s,
+                next_attempt_at = CASE
+                    WHEN %s THEN now() + (%s * interval '1 second')
+                    ELSE next_attempt_at
+                END,
+                claimed_at = NULL,
+                claim_token = NULL,
+                last_error = %s,
+                updated_at = now()
+            WHERE id = %s AND status = 'running' AND claim_token = %s
+            RETURNING id
+            """,
+            (
+                status,
+                retry,
+                delay_seconds,
+                None if success else message,
+                job["id"],
+                job["claim_token"],
+            ),
+        ).fetchone()
+        if result is None:
+            raise RuntimeError(f"Worker no longer owns action job {job['id']}")
+
         if job["operation"] == "execute":
             if success or not retry:
                 conn.execute(
@@ -95,29 +151,6 @@ def _finish_job(job: dict, success: bool, message: str) -> None:
                 WHERE id = %s AND reverted_at IS NULL
                 """,
                 (job["requested_by"], job["action_id"]),
-            )
-
-        if retry:
-            conn.execute(
-                """
-                UPDATE action_jobs
-                SET status = 'queued',
-                    next_attempt_at = now() + (%s * interval '1 second'),
-                    claimed_at = NULL,
-                    last_error = %s,
-                    updated_at = now()
-                WHERE id = %s
-                """,
-                (delay_seconds, message, job["id"]),
-            )
-        else:
-            conn.execute(
-                """
-                UPDATE action_jobs
-                SET status = %s, claimed_at = NULL, last_error = %s, updated_at = now()
-                WHERE id = %s
-                """,
-                ("succeeded" if success else "failed", None if success else message, job["id"]),
             )
 
         event = (
@@ -150,6 +183,14 @@ def process_one_job() -> bool:
     if job is None:
         return False
 
+    heartbeat_stop = threading.Event()
+    lease_lost = threading.Event()
+    heartbeat = threading.Thread(
+        target=_renew_lease,
+        args=(job, heartbeat_stop, lease_lost),
+        daemon=True,
+    )
+    heartbeat.start()
     try:
         executor, command = _job_command(job)
         if job["operation"] == "execute":
@@ -158,7 +199,13 @@ def process_one_job() -> bool:
             success, message = adapters.revert(executor, command)
     except Exception as error:
         success, message = False, f"Action job error: {error}"
+    finally:
+        heartbeat_stop.set()
+        heartbeat.join(timeout=LEASE_RENEW_INTERVAL_SECONDS + 1)
 
+    if lease_lost.is_set():
+        print(f"[action-jobs] job {job['id']} lost its lease before completion")
+        return True
     _finish_job(job, success, message)
     return True
 

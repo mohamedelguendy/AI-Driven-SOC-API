@@ -83,13 +83,31 @@ def _find_active_action(conn, target_value: str, action_type: str, executor: str
     """
     return conn.execute(
         """
-        SELECT a.id, a.result_message FROM actions a
+        SELECT a.* FROM actions a
         JOIN recommendations r ON r.id = a.recommendation_id
         WHERE r.target_value = %s AND r.action_type = %s AND a.executor = %s
           AND a.success = TRUE
           AND a.reverted_at IS NULL
           AND (a.expires_at IS NULL OR a.expires_at > now())
         ORDER BY a.executed_at DESC
+        LIMIT 1
+        """,
+        (target_value, action_type, executor),
+    ).fetchone()
+
+
+def _find_pending_action(conn, target_value: str, action_type: str, executor: str):
+    """Find an execution for this target that is queued or currently running."""
+    return conn.execute(
+        """
+        SELECT a.id
+        FROM actions a
+        JOIN recommendations r ON r.id = a.recommendation_id
+        JOIN action_jobs j ON j.action_id = a.id AND j.operation = 'execute'
+        WHERE r.target_value = %s AND r.action_type = %s AND a.executor = %s
+          AND a.success IS NULL
+          AND j.status IN ('queued', 'running')
+        ORDER BY a.id
         LIMIT 1
         """,
         (target_value, action_type, executor),
@@ -195,6 +213,28 @@ def approve(
                 detail="Target is on the protected allowlist and cannot be acted on",
             )
 
+        command = {
+            "action_type": rec["action_type"],
+            "target": rec["target_value"],
+            "executor": rec["executor"],
+        }
+        conn.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+            (f"{rec['executor']}:{rec['action_type']}:{rec['target_value']}",),
+        )
+        pending = _find_pending_action(
+            conn, rec["target_value"], rec["action_type"], rec["executor"]
+        )
+        if pending:
+            raise HTTPException(
+                status_code=409,
+                detail=f"An identical action is already queued or running (action #{pending['id']})",
+            )
+
+        existing = _find_active_action(
+            conn, rec["target_value"], rec["action_type"], rec["executor"]
+        )
+
         approved = conn.execute(
             """
             UPDATE recommendations
@@ -215,26 +255,23 @@ def approve(
             (user["id"], rec_id, Jsonb({"comment": decision.comment})),
         )
 
-        # --- Duplicate check ---
-        # If the same target already has this exact action in effect,
-        # don't send a second block/isolate — just record the attempt
-        # and point at it. Keeps a flood of AI recommendations for the
-        # same IP from piling up duplicate firewall rules.
-        command = {
-            "action_type": rec["action_type"],
-            "target": rec["target_value"],
-            "executor": rec["executor"],
-        }
-        conn.execute(
-            "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
-            (f"{rec['executor']}:{rec['action_type']}:{rec['target_value']}",),
-        )
-        existing = _find_active_action(conn, rec["target_value"], rec["action_type"], rec["executor"])
-
         if existing:
-            success, result_message = True, f"Already active (action #{existing['id']}) — no new action taken"
-        else:
-            success, result_message = None, "Execution queued"
+            conn.execute(
+                "UPDATE recommendations SET status = 'executed' WHERE id = %s",
+                (rec_id,),
+            )
+            conn.execute(
+                """
+                INSERT INTO audit_log (actor_type, actor_id, event_type, entity_type, entity_id, details)
+                VALUES ('user', %s, 'recommendation.approved_existing_action', 'recommendation', %s, %s)
+                """,
+                (user["id"], rec_id, Jsonb({"action_id": existing["id"]})),
+            )
+            return {
+                "recommendation_id": rec_id,
+                "status": "already_active",
+                "action": existing,
+            }
 
         expires_at = None
         if not rec["is_permanent"]:
@@ -252,30 +289,24 @@ def approve(
                 rec_id,
                 rec["executor"],
                 Jsonb(command),
-                success,
-                result_message,
+                None,
+                "Execution queued",
                 user["id"],
                 expires_at,
             ),
         ).fetchone()
 
-        if existing:
-            conn.execute(
-                "UPDATE recommendations SET status = 'executed' WHERE id = %s",
-                (rec_id,),
-            )
-        else:
-            conn.execute(
-                """
-                INSERT INTO action_jobs (action_id, operation, requested_by)
-                VALUES (%s, 'execute', %s)
-                """,
-                (action["id"], user["id"]),
-            )
+        conn.execute(
+            """
+            INSERT INTO action_jobs (action_id, operation, requested_by)
+            VALUES (%s, 'execute', %s)
+            """,
+            (action["id"], user["id"]),
+        )
 
     return {
         "recommendation_id": rec_id,
-        "status": "executed" if existing else "queued",
+        "status": "queued",
         "action": action,
     }
 
