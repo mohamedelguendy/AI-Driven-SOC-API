@@ -2,9 +2,6 @@
 exists — i.e. the alert IDs it points to are real, and really belong to
 the incident it claims. This is the hallucination check: the AI should
 never be trusted to cite evidence that doesn't exist or doesn't apply.
-
-Unlike the security team's version (which validates against their own
-SecurityEvent table), this checks against YOUR alerts table.
 """
 from typing import Any
 

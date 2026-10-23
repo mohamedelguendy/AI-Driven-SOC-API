@@ -1,17 +1,16 @@
 """Deterministic, rule-based first-pass classification of an alert.
 
-Ported from the security team's app/services/analysis.py. This is NOT
-the AI — it's a simple, explainable rule set that gives tier1 a starting
-suggestion (classification, severity, priority, risk score) before they
-make the real call. Nothing in this file writes to the database or
-changes anything on its own; it only suggests.
+This is NOT the AI — it's a simple, explainable rule set that gives
+tier1 a starting suggestion (classification, severity, priority, risk
+score) before they make the real call. Nothing in this file writes to
+the database or changes anything on its own; it only suggests.
 """
 from typing import Any
 
 
 def analyze_event(event: dict[str, Any]) -> dict[str, Any]:
     signature = (event.get("signature") or "").lower()
-    severity_hint = event.get("severity")  # the raw severity the source reported, if any
+    severity_hint = event.get("severity")
     src_ip = event.get("src_ip")
     dst_ip = event.get("dst_ip")
 
