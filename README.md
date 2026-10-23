@@ -63,8 +63,10 @@ back-end/
    .venv\Scripts\Activate.ps1      # Windows
    pip install -r requirements.txt
    ```
-4. **Create your `.env`:** copy `.env.example` to `.env` and fill in real values
-   (the two threat-intel keys are optional)
+4. **Create your `.env`:** copy `.env.example` to `.env` and replace the
+   placeholders. `JWT_SECRET`, `INGEST_API_KEY`, and `AI_API_KEY` must each be
+   at least 32 characters; generate separate random values for them. The two
+   threat-intel keys are optional.
 5. **Start the database:**
    ```bash
    docker compose up -d
@@ -138,6 +140,9 @@ python scripts/ingest_zeek.py --source /path/to/conn.log --backend http://YOUR-I
 python scripts/ingest_edr.py --source /path/to/edr_alerts.jsonl --backend http://YOUR-IP:8000
 python scripts/ingest_ids_engine.py --source /path/to/ids_alerts.jsonl --backend http://YOUR-IP:8000
 ```
+
+Reusing an `Idempotency-Key` with the same payload returns the original result;
+reusing it with a different payload returns HTTP 409.
 
 Feeders persist file offsets under `~/.soc-ingest` (override with
 `--state-file`) and retry network/server failures without advancing the

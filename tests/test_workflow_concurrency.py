@@ -19,6 +19,7 @@ from fastapi import HTTPException
 from pydantic import ValidationError
 
 from app.alert_classifier import analyze_event
+from app.config import Settings
 from app.schemas import AlertIn, RecommendationIn
 from scripts import ingest_edr, ingest_ids_engine, ingest_suricata, ingest_zeek
 from scripts.ingest_common import follow_file, send_alert
@@ -28,6 +29,24 @@ TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL")
 
 
 class InputValidationTests(unittest.TestCase):
+    def test_application_secrets_must_be_strong_and_non_placeholder(self):
+        required = {
+            "database_url": "postgresql://localhost/soc",
+            "jwt_secret": "j" * 32,
+            "ingest_api_key": "i" * 32,
+            "ai_api_key": "a" * 32,
+        }
+        Settings(**required)
+
+        for secret_name in ("jwt_secret", "ingest_api_key", "ai_api_key"):
+            with self.subTest(secret=secret_name):
+                weak = {**required, secret_name: "short"}
+                with self.assertRaises(ValidationError):
+                    Settings(**weak)
+                placeholder = {**required, secret_name: "generate-a-random-secret-at-least-64-characters-long"}
+                with self.assertRaises(ValidationError):
+                    Settings(**placeholder)
+
     def test_temporary_recommendation_requires_positive_duration(self):
         recommendation = {
             "incident_id": 1,
@@ -512,6 +531,19 @@ class WorkflowConcurrencyTests(unittest.TestCase):
                 ("source-event-1",),
             ).fetchone()["count"]
         self.assertEqual(alert_count, 1)
+
+    def test_reusing_alert_idempotency_key_for_different_payload_conflicts(self):
+        self.alerts.ingest_alert(
+            AlertIn(source="ids", src_ip="198.51.100.44", signature="first"),
+            "source-event-conflict",
+        )
+        with self.assertRaises(HTTPException) as error:
+            self.alerts.ingest_alert(
+                AlertIn(source="ids", src_ip="198.51.100.45", signature="different"),
+                "source-event-conflict",
+            )
+
+        self.assertEqual(error.exception.status_code, 409)
 
     def test_login_attempts_are_limited_by_ip_and_username(self):
         with self.test_pool.connection() as conn:

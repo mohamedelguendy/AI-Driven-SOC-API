@@ -90,6 +90,10 @@ def ingest_alert(
     parse_status = "failed" if not any([event_time, src_ip, dst_ip, alert.hostname]) else (
         "partial" if notes else "ok"
     )
+    if idempotency_key is not None:
+        idempotency_key = idempotency_key.strip()
+    if idempotency_key == "":
+        raise HTTPException(status_code=422, detail="Idempotency-Key must not be empty")
     if idempotency_key is not None and len(idempotency_key) > 255:
         raise HTTPException(status_code=422, detail="Idempotency-Key must be 255 characters or fewer")
 
@@ -101,13 +105,18 @@ def ingest_alert(
             )
             existing = conn.execute(
                 """
-                SELECT id, incident_id, parse_status, parse_notes
+                SELECT id, incident_id, parse_status, parse_notes, raw_event
                 FROM alerts
                 WHERE source_event_id = %s
                 """,
                 (idempotency_key,),
             ).fetchone()
             if existing:
+                if existing["raw_event"] != alert.model_dump():
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Idempotency-Key was already used for a different alert payload",
+                    )
                 conn.execute(
                     """
                     INSERT INTO audit_log

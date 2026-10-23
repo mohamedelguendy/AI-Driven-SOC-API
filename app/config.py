@@ -20,6 +20,16 @@ class Settings(BaseSettings):
     virustotal_api_key: str | None = None
     abuseipdb_api_key: str | None = None
 
+    @field_validator("jwt_secret", "ingest_api_key", "ai_api_key")
+    @classmethod
+    def validate_application_secrets(cls, value: str) -> str:
+        if len(value.strip()) < 32:
+            raise ValueError("must contain at least 32 non-whitespace characters")
+        placeholder_prefixes = ("change-this", "generate-a-random", "replace-with")
+        if value.strip().lower().startswith(placeholder_prefixes):
+            raise ValueError("must be replaced with a randomly generated secret")
+        return value.strip()
+
     @field_validator("virustotal_api_key", "abuseipdb_api_key", mode="before")
     @classmethod
     def treat_disabled_provider_keys_as_unconfigured(cls, value: str | None) -> str | None:
