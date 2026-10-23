@@ -23,9 +23,9 @@ back-end/
     security.py              # password hashing + JWT
     deps.py                    # auth dependency + role checks
     schemas.py               # request/response models
-    analysis.py              # rule-based alert classifier (suggestion only)
+    alert_classifier.py     # rule-based alert classifier (suggestion only)
     evidence_validation.py   # confirms an AI report's cited evidence is real
-    threat_intel.py          # IP reputation lookups (AbuseIPDB / VirusTotal), cached
+    intel_lookup.py          # IP reputation lookups (AbuseIPDB / VirusTotal), cached
     expiry.py                 # background job: auto-reverts expired temporary actions
     adapters/
       firewall.py             # simulated firewall execute()/revert()
@@ -43,8 +43,8 @@ back-end/
     ingest_zeek.py             # feeds Zeek conn.log (filtered) into /alerts/ingest
     ingest_edr.py               # feeds EDR agent alerts into /alerts/ingest
     ingest_ids_engine.py      # feeds brute-force/port-scan alerts into /alerts/ingest
-  schema.sql                  # full database schema
-  migration/                   # incremental DB changes (run in order, once each)
+  back-end schema proto 2.sql # full database schema
+  migration/                   # incremental DB changes (run after the base schema)
   docker-compose.yml          # runs PostgreSQL locally
   create_user.py               # CLI to create an analyst account
   run.py                        # starts the server AND opens /docs automatically
@@ -69,13 +69,10 @@ back-end/
    ```
 6. **Load the schema** (first time only):
    ```bash
-   Get-Content schema.sql | docker exec -i soc_db psql -U soc -d soc
+   Get-Content "back-end schema proto 2.sql" | docker exec -i soc_db psql -U soc -d soc
    ```
-7. **Apply all migrations, in order:**
+7. **Apply the available migration** (after the schema; repeat only when a new migration is added):
    ```bash
-   Get-Content migration/001_add_tier1.sql | docker exec -i soc_db psql -U soc -d soc
-   Get-Content migration/002_add_tier1.sql | docker exec -i soc_db psql -U soc -d soc
-   Get-Content migration/003_add_cve_cvss.sql | docker exec -i soc_db psql -U soc -d soc
    Get-Content migration/004_add_threat_intel.sql | docker exec -i soc_db psql -U soc -d soc
    ```
 8. **Create a user:**
@@ -87,6 +84,19 @@ back-end/
    python run.py
    ```
    Opens `http://localhost:8000/docs` automatically.
+
+## Tests
+
+The PostgreSQL concurrency regression tests use a separate database URL and
+create/drop an isolated schema. Set `TEST_DATABASE_URL` to a disposable
+PostgreSQL database before running them; do not point it at production:
+
+```powershell
+$env:TEST_DATABASE_URL = "postgresql://<db-user>:<db-password>@<db-host>:5432/soc_test"
+python -m unittest discover -s tests -v
+```
+
+The tests are skipped when `TEST_DATABASE_URL` is not set.
 
 ## Roles
 

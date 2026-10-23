@@ -40,10 +40,10 @@ def analyze_event(event: dict[str, Any]) -> dict[str, Any]:
         severity, priority, confidence, risk_score = "HIGH", "P2", 0.65, 70
         evidence.append("Source assigned severity 1 — this alone does not confirm a successful attack.")
         recommendation = "Prioritize analyst review and validate against additional evidence."
-    elif severity_hint == 2:
+    elif severity_hint == 3:
         classification = "MEDIUM_PRIORITY_ALERT"
         severity, priority, confidence, risk_score = "MEDIUM", "P3", 0.60, 45
-        evidence.append("Source assigned severity 2 — investigate context before confirming.")
+        evidence.append("Source assigned severity 3 — investigate context before confirming.")
         recommendation = "Review the signature, affected asset, and surrounding events."
     else:
         evidence.append("No specific high-risk signature pattern matched; not confirmed benign.")

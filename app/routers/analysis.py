@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from ..analysis import analyze_event
+from ..alert_classifier import analyze_event
 from ..db import pool
 from ..deps import get_current_user, require_roles
 from ..evidence_validation import validate_evidence

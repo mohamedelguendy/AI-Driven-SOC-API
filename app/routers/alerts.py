@@ -73,9 +73,13 @@ def ingest_alert(alert: AlertIn):
     if note:
         notes.append(note)
 
-    severity = alert.severity if isinstance(alert.severity, int) else None
+    severity = (
+        alert.severity
+        if type(alert.severity) is int and -32768 <= alert.severity <= 32767
+        else None
+    )
     if alert.severity is not None and severity is None:
-        notes.append(f'severity "{alert.severity}" is not an integer')
+        notes.append(f'severity "{alert.severity}" is outside the supported integer range')
 
     parse_status = "failed" if not any([event_time, src_ip, dst_ip, alert.hostname]) else (
         "partial" if notes else "ok"
@@ -92,8 +96,8 @@ def ingest_alert(alert: AlertIn):
                 JOIN alerts a ON a.incident_id = i.id
                 WHERE a.src_ip = %s
                   AND i.status IN ('new', 'investigating')
-                  AND a.event_time > now() - (%s || ' minutes')::interval
-                ORDER BY a.event_time DESC
+                  AND COALESCE(a.event_time, a.ingested_at) > now() - (%s || ' minutes')::interval
+                ORDER BY COALESCE(a.event_time, a.ingested_at) DESC
                 LIMIT 1
                 """,
                 (src_ip, CORRELATION_WINDOW_MINUTES),
@@ -110,7 +114,7 @@ def ingest_alert(alert: AlertIn):
                 """,
                 (
                     alert.signature or f"{source} alert" + (f" from {src_ip}" if src_ip else ""),
-                    severity or 1,
+                    min(max(severity or 1, 1), 5),
                 ),
             ).fetchone()
             incident_id = incident["id"]

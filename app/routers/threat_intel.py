@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from ..db import pool
 from ..deps import get_current_user
-from ..threat_intel import lookup_ip
+from ..intel_lookup import lookup_ip
 
 router = APIRouter(prefix="/threat-intel", tags=["threat-intel"])
 

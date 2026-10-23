@@ -50,35 +50,51 @@ def _query_abuseipdb(ip: str) -> dict:
 
 
 def lookup_ip(conn, ip_address: str) -> dict:
-    cached = conn.execute(
+    cached_rows = conn.execute(
         """
         SELECT provider, status, verdict, details, queried_at
         FROM threat_intel_lookups
-        WHERE ip_address = %s AND queried_at > now() - %s
-        ORDER BY queried_at DESC LIMIT 1
+        WHERE ip_address = %s
+          AND status <> 'error'
+          AND queried_at > now() - %s
+        ORDER BY provider, queried_at DESC
         """,
         (ip_address, CACHE_TTL),
-    ).fetchone()
-    if cached:
-        return {**cached, "cached": True}
+    ).fetchall()
+    cached_by_provider = {}
+    for row in cached_rows:
+        cached_by_provider.setdefault(row["provider"], row)
 
     results = []
+    all_cached = True
     for provider, key, query_fn in (
         ("abuseipdb", settings.abuseipdb_api_key, _query_abuseipdb),
         ("virustotal", settings.virustotal_api_key, _query_virustotal),
     ):
-        if not key:
+        cached = cached_by_provider.get(provider)
+        use_cached = cached and (cached["status"] != "no_provider_configured" or not key)
+        if use_cached:
+            result = {
+                "provider": provider,
+                "status": cached["status"],
+                "verdict": cached["verdict"],
+                "details": cached["details"],
+            }
+        elif not key:
             result = {"provider": provider, "status": "no_provider_configured", "verdict": "unknown", "details": {}}
+            all_cached = False
         else:
             result = {"provider": provider, **query_fn(ip_address)}
+            all_cached = False
 
-        conn.execute(
-            """
-            INSERT INTO threat_intel_lookups (ip_address, provider, status, verdict, details)
-            VALUES (%s, %s, %s, %s, %s)
-            """,
-            (ip_address, result["provider"], result["status"], result["verdict"], Jsonb(result["details"])),
-        )
+        if not use_cached:
+            conn.execute(
+                """
+                INSERT INTO threat_intel_lookups (ip_address, provider, status, verdict, details)
+                VALUES (%s, %s, %s, %s, %s)
+                """,
+                (ip_address, result["provider"], result["status"], result["verdict"], Jsonb(result["details"])),
+            )
         results.append(result)
 
-    return {"ip_address": ip_address, "results": results, "cached": False}
+    return {"ip_address": ip_address, "results": results, "cached": all_cached}

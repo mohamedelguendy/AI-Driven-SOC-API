@@ -21,6 +21,7 @@ import requests
 DEFAULT_SOURCE = "/var/log/suricata/eve.json"
 POLL_INTERVAL = 0.5
 REQUEST_TIMEOUT = 5
+SEVERITY_MAP = {1: 1, 2: 3, 3: 5}
 
 
 def normalize(event: dict) -> dict:
@@ -32,7 +33,7 @@ def normalize(event: dict) -> dict:
         "src_ip": event.get("src_ip"),
         "dst_ip": event.get("dest_ip"),
         "signature": alert.get("signature"),
-        "severity": alert.get("severity"),  # Suricata: 1=high .. 3=low (passed through as-is)
+        "severity": SEVERITY_MAP.get(alert.get("severity"), alert.get("severity")),
         # extra context kept in raw_event by our tolerant ingestion:
         "dest_port": event.get("dest_port"),
         "category": alert.get("category"),

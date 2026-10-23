@@ -39,7 +39,7 @@ def normalize(record: dict) -> dict:
         "signature": f"Zeek: {record.get('conn_state')} connection "
                      f"({record.get('proto', '?')}/{record.get('service') or 'unknown'}) "
                      f"to port {record.get('id.resp_p')}",
-        "severity": 2,
+        "severity": 3,
         "dest_port": record.get("id.resp_p"),
         "duration": record.get("duration"),
     }

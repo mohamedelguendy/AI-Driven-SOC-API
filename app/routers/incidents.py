@@ -1,3 +1,5 @@
+from typing import Literal
+
 from fastapi import APIRouter, Depends, HTTPException
 from psycopg.types.json import Jsonb
 
@@ -9,7 +11,10 @@ router = APIRouter(prefix="/incidents", tags=["incidents"])
 
 
 @router.get("")
-def list_incidents(status: str | None = None, user: dict = Depends(get_current_user)):
+def list_incidents(
+    status: Literal["new", "investigating", "escalated", "in_response", "resolved", "closed"] | None = None,
+    user: dict = Depends(get_current_user),
+):
     """The incident queue. Tier 1 triage happens first, then tier 2/tier 3
     work the tracked incident. Incidents are ordered by risk so the most
     important case is always surfaced first.
@@ -73,7 +78,7 @@ def triage_incident(
         ).fetchone()
         if incident is None:
             raise HTTPException(status_code=404, detail="Incident not found")
-        if incident["status"] not in ("new", "investigating"):
+        if incident["status"] != "new":
             raise HTTPException(
                 status_code=409,
                 detail=f"Incident is already in status '{incident['status']}' and cannot be triaged again",
@@ -95,11 +100,13 @@ def triage_incident(
                 assigned_tier = %s,
                 updated_at = now(),
                 resolved_at = CASE WHEN %s = 'closed' THEN now() ELSE resolved_at END
-            WHERE id = %s
+            WHERE id = %s AND status = 'new'
             RETURNING id, status, assigned_tier, updated_at
             """,
             (new_status, assigned_tier, new_status, incident_id),
         ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=409, detail="Incident was triaged by another request")
 
         conn.execute(
             """
@@ -175,13 +182,21 @@ def escalate(incident_id: int, user: dict = Depends(require_roles("tier2", "admi
             """
             UPDATE incidents
             SET status = 'escalated', assigned_tier = 'tier3', updated_at = now()
-            WHERE id = %s
+            WHERE id = %s AND status = 'investigating'
             RETURNING id, status
             """,
             (incident_id,),
         ).fetchone()
         if result is None:
-            raise HTTPException(status_code=404, detail="Incident not found")
+            current = conn.execute(
+                "SELECT status FROM incidents WHERE id = %s", (incident_id,)
+            ).fetchone()
+            if current is None:
+                raise HTTPException(status_code=404, detail="Incident not found")
+            raise HTTPException(
+                status_code=409,
+                detail=f"Incident cannot be escalated from status '{current['status']}'",
+            )
 
         conn.execute(
             """
@@ -201,13 +216,21 @@ def resolve(incident_id: int, user: dict = Depends(require_roles("tier2", "tier3
             """
             UPDATE incidents
             SET status = 'resolved', resolved_at = now(), updated_at = now()
-            WHERE id = %s
+            WHERE id = %s AND status IN ('investigating', 'escalated', 'in_response')
             RETURNING id, status
             """,
             (incident_id,),
         ).fetchone()
         if result is None:
-            raise HTTPException(status_code=404, detail="Incident not found")
+            current = conn.execute(
+                "SELECT status FROM incidents WHERE id = %s", (incident_id,)
+            ).fetchone()
+            if current is None:
+                raise HTTPException(status_code=404, detail="Incident not found")
+            raise HTTPException(
+                status_code=409,
+                detail=f"Incident cannot be resolved from status '{current['status']}'",
+            )
 
         conn.execute(
             """

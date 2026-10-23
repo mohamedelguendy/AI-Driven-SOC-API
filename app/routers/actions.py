@@ -42,6 +42,7 @@ def revert_action(
             SELECT a.*, r.action_type, r.target_value
             FROM actions a JOIN recommendations r ON r.id = a.recommendation_id
             WHERE a.id = %s
+            FOR UPDATE OF a
             """,
             (action_id,),
         ).fetchone()

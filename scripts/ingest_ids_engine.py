@@ -35,7 +35,7 @@ import requests
 POLL_INTERVAL = 0.5
 REQUEST_TIMEOUT = 5
 
-SEVERITY_MAP = {"LOW": 1, "MEDIUM": 3, "HIGH": 5}
+SEVERITY_MAP = {"LOW": 5, "MEDIUM": 3, "HIGH": 1}
 
 
 def normalize(alert: dict) -> dict:

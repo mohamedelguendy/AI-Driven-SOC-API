@@ -26,6 +26,9 @@ def _revert_expired_once():
               AND a.expires_at IS NOT NULL
               AND a.expires_at <= now()
               AND a.success = TRUE
+            ORDER BY a.expires_at, a.id
+            LIMIT 100
+            FOR UPDATE OF a SKIP LOCKED
             """
         ).fetchall()
  

@@ -1,5 +1,5 @@
 from datetime import datetime, timedelta, timezone
-from ipaddress import ip_address, ip_network
+from ipaddress import ip_network
 
 from fastapi import APIRouter, Depends, Header, HTTPException
 from psycopg.types.json import Jsonb
@@ -56,17 +56,20 @@ def determine_impact(conn, action_type: str, target_scope: str, is_internal: boo
 
 
 def _is_protected(conn, target_value: str) -> bool:
-    """True if the target falls inside the protected allowlist. Blocks
-    execution for every role, no exceptions.
+    """True if an IP target overlaps a protected network.
+
+    Overlap matters for subnet actions: a block range containing a protected
+    host is unsafe even when the full action range is not inside that host's
+    allowlisted network.
     """
     try:
-        ip_address(target_value.split("/")[0])
+        target_network = ip_network(target_value, strict=False)
     except ValueError:
         return False  # not an IP target (e.g. isolate_host by hostname) — allowlist doesn't apply
 
     row = conn.execute(
-        "SELECT 1 FROM protected_targets WHERE %s::inet <<= target LIMIT 1",
-        (target_value,),
+        "SELECT 1 FROM protected_targets WHERE %s::cidr && target LIMIT 1",
+        (str(target_network),),
     ).fetchone()
     return row is not None
 
@@ -191,14 +194,18 @@ def approve(
                 detail="Target is on the protected allowlist and cannot be acted on",
             )
 
-        conn.execute(
+        approved = conn.execute(
             """
             UPDATE recommendations
             SET status = 'approved', decided_by = %s, decided_at = now()
-            WHERE id = %s
+            WHERE id = %s AND status = 'pending'
+            RETURNING id
             """,
             (user["id"], rec_id),
-        )
+        ).fetchone()
+        if approved is None:
+            raise HTTPException(status_code=409, detail="Recommendation is no longer pending")
+
         conn.execute(
             """
             INSERT INTO audit_log (actor_type, actor_id, event_type, entity_type, entity_id, details)
@@ -288,14 +295,18 @@ def reject(
         if rec["status"] != "pending":
             raise HTTPException(status_code=409, detail=f"Already {rec['status']}")
 
-        conn.execute(
+        rejected = conn.execute(
             """
             UPDATE recommendations
             SET status = 'rejected', decided_by = %s, decided_at = now()
-            WHERE id = %s
+            WHERE id = %s AND status = 'pending'
+            RETURNING id
             """,
             (user["id"], rec_id),
-        )
+        ).fetchone()
+        if rejected is None:
+            raise HTTPException(status_code=409, detail="Recommendation is no longer pending")
+
         conn.execute(
             """
             INSERT INTO audit_log (actor_type, actor_id, event_type, entity_type, entity_id, details)
