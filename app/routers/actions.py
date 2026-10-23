@@ -1,9 +1,6 @@
-from datetime import datetime, timezone
-
 from fastapi import APIRouter, Depends, HTTPException
 from psycopg.types.json import Jsonb
 
-from .. import adapters
 from ..db import pool
 from ..deps import get_current_user, require_roles
 from ..schemas import DecisionIn
@@ -18,7 +15,10 @@ def list_actions(active_only: bool = False, user: dict = Depends(get_current_use
     """
     query = "SELECT * FROM actions"
     if active_only:
-        query += " WHERE reverted_at IS NULL AND (expires_at IS NULL OR expires_at > now())"
+        query += (
+            " WHERE success IS TRUE AND reverted_at IS NULL "
+            "AND (expires_at IS NULL OR expires_at > now())"
+        )
     query += " ORDER BY executed_at DESC"
     with pool.connection() as conn:
         rows = conn.execute(query).fetchall()
@@ -53,35 +53,28 @@ def revert_action(
         if not action["success"]:
             raise HTTPException(status_code=409, detail="Action never succeeded — nothing to revert")
 
-        command = {
-            "action_type": action["action_type"],
-            "target": action["target_value"],
-            "executor": action["executor"],
-        }
-        success, message = adapters.revert(action["executor"], command)
-
-        if success:
-            conn.execute(
-                """
-                UPDATE actions
-                SET reverted_at = now(), reverted_by = %s
-                WHERE id = %s
-                """,
-                (user["id"], action_id),
-            )
-        event = "action.reverted" if success else "action.revert_failed"
+        job = conn.execute(
+            """
+            INSERT INTO action_jobs (action_id, operation, requested_by)
+            VALUES (%s, 'revert', %s)
+            ON CONFLICT (action_id, operation) DO NOTHING
+            RETURNING id
+            """,
+            (action_id, user["id"]),
+        ).fetchone()
+        if job is None:
+            raise HTTPException(status_code=409, detail="A revert is already queued or has been attempted")
         conn.execute(
             """
             INSERT INTO audit_log (actor_type, actor_id, event_type, entity_type, entity_id, details)
             VALUES ('user', %s, %s, 'action', %s, %s)
             """,
-            (user["id"], event, action_id, Jsonb({"message": message, "comment": decision.comment})),
+            (
+                user["id"],
+                "action.revert_queued",
+                action_id,
+                Jsonb({"job_id": job["id"], "comment": decision.comment}),
+            ),
         )
 
-    if not success:
-        # The attempt is logged above either way (requirement: log every
-        # attempt, not just successes). The adapter/device stays in its
-        # current state since we couldn't confirm the revert worked.
-        raise HTTPException(status_code=502, detail=f"Revert failed: {message}")
-
-    return {"action_id": action_id, "reverted": True, "message": message}
+    return {"action_id": action_id, "reverted": False, "status": "queued", "job_id": job["id"]}

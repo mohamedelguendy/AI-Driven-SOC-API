@@ -50,7 +50,10 @@ def _safe_time(value: str | None) -> tuple[datetime | None, str | None]:
 
 
 @router.post("/ingest", dependencies=[Depends(_check_ingest_key)])
-def ingest_alert(alert: AlertIn):
+def ingest_alert(
+    alert: AlertIn,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+):
     """Receive one security event. Never rejects a payload outright —
     always stores raw_event, and marks what it could not parse.
     """
@@ -84,12 +87,53 @@ def ingest_alert(alert: AlertIn):
     parse_status = "failed" if not any([event_time, src_ip, dst_ip, alert.hostname]) else (
         "partial" if notes else "ok"
     )
+    if idempotency_key is not None and len(idempotency_key) > 255:
+        raise HTTPException(status_code=422, detail="Idempotency-Key must be 255 characters or fewer")
 
     with pool.connection() as conn:
+        if idempotency_key:
+            conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (f"alert-idempotency:{idempotency_key}",),
+            )
+            existing = conn.execute(
+                """
+                SELECT id, incident_id, parse_status, parse_notes
+                FROM alerts
+                WHERE source_event_id = %s
+                """,
+                (idempotency_key,),
+            ).fetchone()
+            if existing:
+                conn.execute(
+                    """
+                    INSERT INTO audit_log
+                        (actor_type, event_type, entity_type, entity_id, details)
+                    VALUES ('system', 'alert.ingest_duplicate', 'alert', %s, %s)
+                    """,
+                    (
+                        existing["id"],
+                        Jsonb({"source_event_id": idempotency_key}),
+                    ),
+                )
+                return {
+                    "alert_id": existing["id"],
+                    "incident_id": existing["incident_id"],
+                    "parse_status": existing["parse_status"],
+                    "parse_notes": existing["parse_notes"].split("; ")
+                    if existing["parse_notes"]
+                    else [],
+                    "duplicate": True,
+                }
+
         # Correlate: attach to a recent open incident from the same src_ip,
         # otherwise open a new one.
         incident_id = None
         if src_ip:
+            conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (f"alert-correlation:{src_ip}",),
+            )
             row = conn.execute(
                 """
                 SELECT i.id FROM incidents i
@@ -97,6 +141,7 @@ def ingest_alert(alert: AlertIn):
                 WHERE a.src_ip = %s
                   AND i.status IN ('new', 'investigating')
                   AND COALESCE(a.event_time, a.ingested_at) > now() - (%s || ' minutes')::interval
+                  AND COALESCE(a.event_time, a.ingested_at) <= now() + interval '5 minutes'
                 ORDER BY COALESCE(a.event_time, a.ingested_at) DESC
                 LIMIT 1
                 """,
@@ -122,13 +167,14 @@ def ingest_alert(alert: AlertIn):
         row = conn.execute(
             """
             INSERT INTO alerts
-                (incident_id, source, event_time, src_ip, dst_ip, hostname,
+                (incident_id, source_event_id, source, event_time, src_ip, dst_ip, hostname,
                  signature, severity, parse_status, parse_notes, raw_event)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING id
             """,
             (
                 incident_id,
+                idempotency_key,
                 source,
                 event_time,
                 src_ip,
@@ -155,4 +201,5 @@ def ingest_alert(alert: AlertIn):
         "incident_id": incident_id,
         "parse_status": parse_status,
         "parse_notes": notes,
+        "duplicate": False,
     }

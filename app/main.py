@@ -3,19 +3,25 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from . import expiry
+from . import action_jobs, expiry
 from .db import pool
 from .routers import actions, alerts, analysis, auth, incidents, recommendations, threat_intel
-
-_expiry_stop = threading.Event()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    expiry.start(_expiry_stop)  # auto-reverts expired temporary blocks in the background
-    yield
-    _expiry_stop.set()
-    pool.close()  # close the database pool cleanly on shutdown
+    stop_event = threading.Event()
+    workers = [
+        expiry.start(stop_event),
+        action_jobs.start(stop_event),
+    ]
+    try:
+        yield
+    finally:
+        stop_event.set()
+        for worker in workers:
+            worker.join(timeout=10)
+        pool.close()
 
 
 app = FastAPI(title="AI-Driven SOC API", lifespan=lifespan)

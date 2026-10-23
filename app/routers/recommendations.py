@@ -4,7 +4,6 @@ from ipaddress import ip_network
 from fastapi import APIRouter, Depends, Header, HTTPException
 from psycopg.types.json import Jsonb
 
-from .. import adapters
 from ..config import settings
 from ..db import pool
 from ..deps import get_current_user, require_roles
@@ -23,15 +22,17 @@ def _check_ai_key(x_api_key: str | None = Header(default=None)):
 
 
 def _looks_internal(target_value: str) -> bool:
-    """Best-effort guess at whether a target is on the internal network.
-    Used only as one input to impact classification below; when in doubt
-    the impact_rules fallback (see determine_impact) defaults to high.
-    """
+    """Return whether an IP target overlaps a configured internal network."""
     try:
-        net = ip_network(target_value, strict=False)
-        return net.is_private
+        target_network = ip_network(target_value, strict=False)
     except ValueError:
-        return False  # not an IP (e.g. a hostname) — can't tell, don't guess
+        return False
+
+    for cidr in settings.internal_network_cidrs.split(","):
+        internal_network = ip_network(cidr.strip(), strict=False)
+        if target_network.version == internal_network.version and target_network.overlaps(internal_network):
+            return True
+    return False
 
 
 def determine_impact(conn, action_type: str, target_scope: str, is_internal: bool, is_permanent: bool) -> str:
@@ -224,21 +225,19 @@ def approve(
             "target": rec["target_value"],
             "executor": rec["executor"],
         }
+        conn.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+            (f"{rec['executor']}:{rec['action_type']}:{rec['target_value']}",),
+        )
         existing = _find_active_action(conn, rec["target_value"], rec["action_type"], rec["executor"])
 
         if existing:
             success, result_message = True, f"Already active (action #{existing['id']}) — no new action taken"
         else:
-            # --- Execute ---
-            # Routed through app/adapters: firewall.py or edr.py depending on
-            # rec["executor"]. Both simulate for now; see those files for how
-            # to plug in the real integration once access details are shared.
-            # adapters.execute() never raises — an adapter crash comes back
-            # as (False, "Adapter error: ..."), never a 500.
-            success, result_message = adapters.execute(rec["executor"], command)
+            success, result_message = None, "Execution queued"
 
         expires_at = None
-        if not rec["is_permanent"] and rec["duration_secs"]:
+        if not rec["is_permanent"]:
             expires_at = datetime.now(timezone.utc) + timedelta(seconds=rec["duration_secs"])
 
         action = conn.execute(
@@ -260,24 +259,25 @@ def approve(
             ),
         ).fetchone()
 
-        conn.execute(
-            "UPDATE recommendations SET status = %s WHERE id = %s",
-            ("executed" if success else "failed", rec_id),
-        )
-        conn.execute(
-            """
-            INSERT INTO audit_log (actor_type, actor_id, event_type, entity_type, entity_id, details)
-            VALUES ('user', %s, %s, 'action', %s, %s)
-            """,
-            (
-                user["id"],
-                "action.executed" if success else "action.failed",
-                action["id"],
-                Jsonb(command),
-            ),
-        )
+        if existing:
+            conn.execute(
+                "UPDATE recommendations SET status = 'executed' WHERE id = %s",
+                (rec_id,),
+            )
+        else:
+            conn.execute(
+                """
+                INSERT INTO action_jobs (action_id, operation, requested_by)
+                VALUES (%s, 'execute', %s)
+                """,
+                (action["id"], user["id"]),
+            )
 
-    return {"recommendation_id": rec_id, "status": "executed" if success else "failed", "action": action}
+    return {
+        "recommendation_id": rec_id,
+        "status": "executed" if existing else "queued",
+        "action": action,
+    }
 
 
 @router.post("/{rec_id}/reject")

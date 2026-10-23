@@ -11,14 +11,12 @@ Run on the box where Zeek is writing its logs:
     python ingest_zeek.py --source /path/to/conn.log --replay
 """
 import argparse
-import json
 import os
-import time
 
-import requests
-
-POLL_INTERVAL = 0.5
-REQUEST_TIMEOUT = 5
+if __package__:
+    from .ingest_common import follow_file, parse_json_line, send_alert
+else:
+    from ingest_common import follow_file, parse_json_line, send_alert
 
 # Only forward connections matching one of these — otherwise conn.log is
 # far too noisy (every DNS lookup, every normal web request) to treat as
@@ -57,47 +55,13 @@ def _ts_to_iso(ts):
         return str(ts)
 
 
-def send_alert(backend_url: str, api_key: str, payload: dict) -> bool:
-    try:
-        resp = requests.post(
-            f"{backend_url}/alerts/ingest",
-            json=payload,
-            headers={"X-API-Key": api_key},
-            timeout=REQUEST_TIMEOUT,
-        )
-        if resp.status_code == 200:
-            print(f"[sent] {payload['signature']} -> {resp.json()}")
-            return True
-        print(f"[error] backend returned {resp.status_code}: {resp.text}")
-        return False
-    except requests.RequestException as e:
-        print(f"[error] could not reach backend: {e}")
-        return False
-
-
-def follow(path: str, replay: bool):
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
-        if not replay:
-            f.seek(0, os.SEEK_END)
-        while True:
-            line = f.readline()
-            if not line:
-                time.sleep(POLL_INTERVAL)
-                try:
-                    if os.path.getsize(path) < f.tell():
-                        f.seek(0)
-                except OSError:
-                    pass
-                continue
-            yield line
-
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", required=True, help="Path to Zeek's conn.log (JSON format)")
     parser.add_argument("--backend", default=os.environ.get("BACKEND_URL", "http://localhost:8000"))
     parser.add_argument("--api-key", default=os.environ.get("INGEST_API_KEY"))
     parser.add_argument("--replay", action="store_true")
+    parser.add_argument("--state-file", help="Checkpoint file path (defaults to a per-source file under ~/.soc-ingest)")
     args = parser.parse_args()
 
     if not args.api_key:
@@ -106,16 +70,20 @@ def main():
     print(f"Watching {args.source} -> {args.backend}/alerts/ingest "
           f"(forwarding only: {sorted(INTERESTING_STATES)})")
 
-    for line in follow(args.source, args.replay):
-        try:
-            record = json.loads(line)
-        except json.JSONDecodeError:
+    for line_number, (line, acknowledge, idempotency_key) in enumerate(
+        follow_file(args.source, args.replay, args.state_file), 1
+    ):
+        record = parse_json_line(line, args.source, line_number)
+        if record is None:
+            acknowledge()
             continue
 
         if not is_interesting(record):
+            acknowledge()
             continue
 
-        send_alert(args.backend, args.api_key, normalize(record))
+        send_alert(args.backend, args.api_key, normalize(record), idempotency_key)
+        acknowledge()
 
 
 if __name__ == "__main__":

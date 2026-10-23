@@ -17,7 +17,7 @@ response execution via firewall/EDR adapters.
 ```
 back-end/
   app/
-    main.py                 # entry point, wires routers together, starts the expiry job
+    main.py                 # entry point, wires routers together, starts background workers
     config.py                # loads .env
     db.py                     # PostgreSQL connection pool
     security.py              # password hashing + JWT
@@ -26,7 +26,8 @@ back-end/
     alert_classifier.py     # rule-based alert classifier (suggestion only)
     evidence_validation.py   # confirms an AI report's cited evidence is real
     intel_lookup.py          # IP reputation lookups (AbuseIPDB / VirusTotal), cached
-    expiry.py                 # background job: auto-reverts expired temporary actions
+    expiry.py                 # queues reverts for expired temporary actions
+    action_jobs.py            # durable, retryable execution/revert worker
     adapters/
       firewall.py             # simulated firewall execute()/revert()
       edr.py                  # simulated EDR execute()/revert()
@@ -39,9 +40,10 @@ back-end/
       analysis.py               # POST /analysis/classify, /analysis/validate-evidence
       threat_intel.py          # GET /threat-intel/{ip}, GET /threat-intel
   scripts/
+    ingest_common.py          # shared checkpointing and retry-safe alert delivery
     ingest_suricata.py        # feeds Suricata eve.json alerts into /alerts/ingest
-    ingest_zeek.py             # feeds Zeek conn.log (filtered) into /alerts/ingest
-    ingest_edr.py               # feeds EDR agent alerts into /alerts/ingest
+    ingest_zeek.py            # feeds Zeek conn.log (filtered) into /alerts/ingest
+    ingest_edr.py             # feeds EDR agent alerts into /alerts/ingest
     ingest_ids_engine.py      # feeds brute-force/port-scan alerts into /alerts/ingest
   back-end schema proto 2.sql # full database schema
   migration/                   # incremental DB changes (run after the base schema)
@@ -71,9 +73,12 @@ back-end/
    ```bash
    Get-Content "back-end schema proto 2.sql" | docker exec -i soc_db psql -U soc -d soc
    ```
-7. **Apply the available migration** (after the schema; repeat only when a new migration is added):
+7. **Apply migrations** (after the schema; apply each migration once, in order):
    ```bash
    Get-Content migration/004_add_threat_intel.sql | docker exec -i soc_db psql -U soc -d soc
+   Get-Content migration/005_action_jobs.sql | docker exec -i soc_db psql -U soc -d soc
+   Get-Content migration/006_login_rate_limits.sql | docker exec -i soc_db psql -U soc -d soc
+   Get-Content migration/007_alert_ingest_idempotency.sql | docker exec -i soc_db psql -U soc -d soc
    ```
 8. **Create a user:**
    ```bash
@@ -87,8 +92,8 @@ back-end/
 
 ## Tests
 
-The PostgreSQL concurrency regression tests use a separate database URL and
-create/drop an isolated schema. Set `TEST_DATABASE_URL` to a disposable
+The PostgreSQL regression tests use a separate database URL and create/drop
+an isolated schema. Set `TEST_DATABASE_URL` to a disposable
 PostgreSQL database before running them; do not point it at production:
 
 ```powershell
@@ -116,9 +121,9 @@ The tests are skipped when `TEST_DATABASE_URL` is not set.
 | `GET /threat-intel/{ip}` | IP reputation (AbuseIPDB / VirusTotal), cached 1 hour |
 | `POST /recommendations` | AI submits a recommendation (needs `X-API-Key`: `AI_API_KEY`) |
 | `POST /analysis/validate-evidence` | Confirms an AI report's cited alert IDs are real |
-| `POST /recommendations/{id}/approve` | Tier2 (low-impact) / tier3 (any) approve + execute |
-| `POST /actions/{id}/revert` | Manually undo an action |
-| `GET /actions?active_only=true` | What's currently blocked/isolated |
+| `POST /recommendations/{id}/approve` | Tier2 (low-impact) / tier3 (any) approve and queue execution |
+| `POST /actions/{id}/revert` | Queue a manual action reversal |
+| `GET /actions?active_only=true` | Successfully applied actions still in effect |
 
 ## Feeding real security tools into the pipeline
 
@@ -133,6 +138,13 @@ python scripts/ingest_edr.py --source /path/to/edr_alerts.jsonl --backend http:/
 python scripts/ingest_ids_engine.py --source /path/to/ids_alerts.jsonl --backend http://YOUR-IP:8000
 ```
 
+Feeders persist file offsets under `~/.soc-ingest` (override with
+`--state-file`) and retry network/server failures without advancing the
+checkpoint. They send a stable `Idempotency-Key` for each source line, so
+install migration 007 before enabling them. Use `--replay` to start at the
+beginning of a log. Internal targets default to RFC1918 IPv4 ranges; override
+them with the comma-separated `INTERNAL_NETWORK_CIDRS` setting.
+
 ⚠️ Don't run `ingest_suricata.py` and an `ids_engine.py`-fed
 `ingest_ids_engine.py` together if the IDS engine is also processing
 Suricata's own events — that double-ingests Suricata alerts. See the
@@ -141,4 +153,7 @@ docstring in `ingest_ids_engine.py`.
 ## Status
 
 Firewall/EDR execution is currently simulated (logged, not sent to a real
-device) — pending access details from the security team.
+device) — pending access details from the security team. Approvals and
+reversions are durable queued jobs; the worker retries failures up to eight
+times with exponential backoff. A real executor must honor the stable
+idempotency key included in its command to prevent duplicated side effects.

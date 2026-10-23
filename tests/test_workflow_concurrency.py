@@ -1,12 +1,14 @@
 import atexit
+import json
 import os
+import tempfile
 import threading
 import unittest
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import psycopg
 from psycopg import sql
@@ -19,6 +21,7 @@ from pydantic import ValidationError
 from app.alert_classifier import analyze_event
 from app.schemas import AlertIn, RecommendationIn
 from scripts import ingest_edr, ingest_ids_engine, ingest_suricata, ingest_zeek
+from scripts.ingest_common import follow_file, send_alert
 
 
 TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL")
@@ -75,10 +78,79 @@ class InputValidationTests(unittest.TestCase):
         )["severity"]
         self.assertEqual(zeek_severity, 3)
 
+
+class IngestHelperTests(unittest.TestCase):
+    def test_checkpoint_restart_replays_unacknowledged_line_with_same_key(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "events.jsonl"
+            state = Path(directory) / "state.json"
+            source.write_text('{"event":1}\n{"event":2}\n', encoding="utf-8")
+
+            first_stream = follow_file(str(source), replay=True, state_file=str(state))
+            first_line, _, first_key = next(first_stream)
+            first_stream.close()
+
+            self.assertEqual(json.loads(state.read_text(encoding="utf-8"))["offset"], 0)
+
+            restarted_stream = follow_file(
+                str(source), replay=False, state_file=str(state)
+            )
+            replayed_line, acknowledge, replayed_key = next(restarted_stream)
+            self.assertEqual(replayed_line, first_line)
+            self.assertEqual(replayed_key, first_key)
+            acknowledge()
+            restarted_stream.close()
+
+            final_stream = follow_file(str(source), replay=False, state_file=str(state))
+            next_line, _, _ = next(final_stream)
+            final_stream.close()
+            self.assertEqual(next_line, '{"event":2}\n')
+
+    def test_delivery_retries_server_error_and_preserves_idempotency_key(self):
+        unavailable = Mock(status_code=503, headers={"Retry-After": "invalid"})
+        unavailable.text = "temporarily unavailable"
+        accepted = Mock(status_code=200, headers={})
+        responses = iter((unavailable, accepted))
+
+        with patch(
+            "scripts.ingest_common.requests.post",
+            side_effect=lambda *args, **kwargs: next(responses),
+        ) as post, patch("scripts.ingest_common.time.sleep"):
+            self.assertTrue(
+                send_alert("http://localhost", "key", {"signature": "test"}, "event-key")
+            )
+
+        self.assertEqual(post.call_count, 2)
+        self.assertEqual(
+            [call.kwargs["headers"]["Idempotency-Key"] for call in post.call_args_list],
+            ["event-key", "event-key"],
+        )
+
+    def test_delivery_does_not_retry_client_error(self):
+        rejected = Mock(status_code=422, headers={})
+        rejected.text = "invalid alert"
+        with patch("scripts.ingest_common.requests.post", return_value=rejected) as post, patch(
+            "scripts.ingest_common.time.sleep"
+        ) as sleep:
+            with self.assertRaisesRegex(RuntimeError, "HTTP 422"):
+                send_alert("http://localhost", "key", {"signature": "test"}, "event-key")
+
+        post.assert_called_once()
+        sleep.assert_not_called()
+
     def test_classifier_interprets_normalized_high_medium_low_severity(self):
         self.assertEqual(analyze_event({"severity": 1})["severity"], "HIGH")
         self.assertEqual(analyze_event({"severity": 3})["severity"], "MEDIUM")
         self.assertEqual(analyze_event({"severity": 5})["severity"], "LOW")
+
+    def test_internal_target_uses_configured_rfc1918_networks(self):
+        from app.routers.recommendations import _looks_internal
+
+        self.assertTrue(_looks_internal("10.23.5.4"))
+        self.assertTrue(_looks_internal("172.16.0.0/12"))
+        self.assertTrue(_looks_internal("192.168.1.0/24"))
+        self.assertFalse(_looks_internal("8.8.8.8"))
+        self.assertFalse(_looks_internal("security-host.example"))
 
 
 class ThreatIntelCacheTests(unittest.TestCase):
@@ -175,8 +247,15 @@ class WorkflowConcurrencyTests(unittest.TestCase):
             conn.execute(sql.SQL("SET search_path TO {}").format(sql.Identifier(cls.schema)))
             schema_path = Path(__file__).resolve().parents[1] / "back-end schema proto 2.sql"
             conn.execute(schema_path.read_text(encoding="utf-8"), prepare=False)
-            migration_path = Path(__file__).resolve().parents[1] / "migration" / "004_add_threat_intel.sql"
-            conn.execute(migration_path.read_text(encoding="utf-8"), prepare=False)
+            migration_dir = Path(__file__).resolve().parents[1] / "migration"
+            for migration_name in (
+                "004_add_threat_intel.sql",
+                "005_action_jobs.sql",
+                "006_login_rate_limits.sql",
+                "007_alert_ingest_idempotency.sql",
+            ):
+                migration_path = migration_dir / migration_name
+                conn.execute(migration_path.read_text(encoding="utf-8"), prepare=False)
 
         test_conninfo = make_conninfo(
             TEST_DATABASE_URL,
@@ -191,27 +270,33 @@ class WorkflowConcurrencyTests(unittest.TestCase):
         )
 
         import app.db as db_module
-        from app import expiry
-        from app.routers import actions, alerts, incidents, recommendations
+        from app import action_jobs, expiry
+        from app.routers import actions, alerts, auth, incidents, recommendations
 
+        cls.action_jobs = action_jobs
         cls.expiry = expiry
         cls.actions = actions
         cls.alerts = alerts
+        cls.auth = auth
         cls.incidents = incidents
         cls.recommendations = recommendations
         cls.original_pools = {
             db_module: db_module.pool,
+            action_jobs: action_jobs.pool,
             expiry: expiry.pool,
             actions: actions.pool,
             alerts: alerts.pool,
+            auth: auth.pool,
             incidents: incidents.pool,
             recommendations: recommendations.pool,
         }
         atexit.register(db_module.pool.close)
         db_module.pool = cls.test_pool
+        action_jobs.pool = cls.test_pool
         expiry.pool = cls.test_pool
         actions.pool = cls.test_pool
         alerts.pool = cls.test_pool
+        auth.pool = cls.test_pool
         incidents.pool = cls.test_pool
         recommendations.pool = cls.test_pool
 
@@ -390,7 +475,7 @@ class WorkflowConcurrencyTests(unittest.TestCase):
 
     def test_alert_with_out_of_range_severity_is_still_ingested(self):
         result = self.alerts.ingest_alert(
-            AlertIn(source="ids", severity=2**40)
+            AlertIn(source="ids", severity=2**40), None
         )
 
         with self.test_pool.connection() as conn:
@@ -408,6 +493,77 @@ class WorkflowConcurrencyTests(unittest.TestCase):
         self.assertIn("outside the supported integer range", alert["parse_notes"])
         self.assertGreaterEqual(incident["severity"], 1)
         self.assertLessEqual(incident["severity"], 5)
+
+    def test_retried_alert_ingest_returns_existing_alert(self):
+        payload = AlertIn(source="ids", src_ip="198.51.100.44", signature="retry")
+        first = self.alerts.ingest_alert(payload, "source-event-1")
+        second = self.alerts.ingest_alert(payload, "source-event-1")
+
+        self.assertFalse(first["duplicate"])
+        self.assertTrue(second["duplicate"])
+        self.assertEqual(first["alert_id"], second["alert_id"])
+        self.assertEqual(first["incident_id"], second["incident_id"])
+
+        with self.test_pool.connection() as conn:
+            alert_count = conn.execute(
+                "SELECT count(*) AS count FROM alerts WHERE source_event_id = %s",
+                ("source-event-1",),
+            ).fetchone()["count"]
+        self.assertEqual(alert_count, 1)
+
+    def test_login_attempts_are_limited_by_ip_and_username(self):
+        with self.test_pool.connection() as conn:
+            for _ in range(self.auth.LOGIN_ATTEMPT_LIMIT):
+                self.assertIsNone(
+                    self.auth._record_login_attempt(conn, "limit-user", "198.51.100.9")
+                )
+            retry_after = self.auth._record_login_attempt(
+                conn, "limit-user", "198.51.100.9"
+            )
+
+        self.assertIsNotNone(retry_after)
+        self.assertGreater(retry_after, 0)
+        self.assertLessEqual(retry_after, int(self.auth.LOGIN_WINDOW.total_seconds()))
+
+    def test_concurrent_alert_ingest_for_same_source_correlates_once(self):
+        barrier = threading.Barrier(2)
+        original_pool = self.alerts.pool
+        test_pool = self.test_pool
+
+        class SynchronizedConnection:
+            def __init__(self, connection):
+                self.connection = connection
+
+            def execute(self, query, *args, **kwargs):
+                if "alert-correlation:" in str(query):
+                    barrier.wait(timeout=5)
+                return self.connection.execute(query, *args, **kwargs)
+
+            def __getattr__(self, name):
+                return getattr(self.connection, name)
+
+        class SynchronizedPool:
+            @contextmanager
+            def connection(self):
+                with test_pool.connection() as connection:
+                    yield SynchronizedConnection(connection)
+
+        self.alerts.pool = SynchronizedPool()
+        try:
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                futures = [
+                    executor.submit(
+                        self.alerts.ingest_alert,
+                        AlertIn(source="ids", src_ip="198.51.100.20", signature=f"event-{index}"),
+                        None,
+                    )
+                    for index in range(2)
+                ]
+                results = [future.result(timeout=10) for future in futures]
+        finally:
+            self.alerts.pool = original_pool
+
+        self.assertEqual(results[0]["incident_id"], results[1]["incident_id"])
 
     def test_concurrent_approve_and_reject_make_one_decision(self):
         recommendation_id = self._create_recommendation()
@@ -433,7 +589,7 @@ class WorkflowConcurrencyTests(unittest.TestCase):
             )
 
         try:
-            with patch.object(self.recommendations.adapters, "execute", side_effect=execute_action):
+            with patch.object(self.action_jobs.adapters, "execute", side_effect=execute_action):
                 with ThreadPoolExecutor(max_workers=2) as executor:
                     futures = [executor.submit(approve), executor.submit(reject)]
                     results = []
@@ -451,6 +607,10 @@ class WorkflowConcurrencyTests(unittest.TestCase):
         self.assertEqual(len(conflicts), 1)
         self.assertEqual(conflicts[0].status_code, 409)
 
+        self.assertEqual(len(execute_calls), 0)
+        if successes[0]["status"] == "queued":
+            self.assertTrue(self.action_jobs.process_one_job())
+
         with self.test_pool.connection() as conn:
             final = conn.execute(
                 "SELECT status FROM recommendations WHERE id = %s",
@@ -458,6 +618,52 @@ class WorkflowConcurrencyTests(unittest.TestCase):
             ).fetchone()
         self.assertIn(final["status"], ("executed", "rejected"))
         self.assertEqual(len(execute_calls), 1 if final["status"] == "executed" else 0)
+        if execute_calls:
+            self.assertTrue(execute_calls[0][1]["idempotency_key"].startswith("soc-action-"))
+
+    def test_execution_job_retries_with_a_stable_idempotency_key(self):
+        recommendation_id = self._create_recommendation()
+        response = self.recommendations.approve(
+            recommendation_id,
+            self.recommendations.DecisionIn(),
+            {"id": self.user_id, "role": "tier2"},
+        )
+        action_id = response["action"]["id"]
+        commands = []
+
+        def execute_action(executor, command):
+            commands.append(command)
+            if len(commands) == 1:
+                return False, "Temporary test failure"
+            return True, "Test action completed"
+
+        with patch.object(self.action_jobs.adapters, "execute", side_effect=execute_action):
+            self.assertTrue(self.action_jobs.process_one_job())
+            with self.test_pool.connection() as conn:
+                conn.execute(
+                    "UPDATE action_jobs SET next_attempt_at = now() WHERE action_id = %s",
+                    (action_id,),
+                )
+            self.assertTrue(self.action_jobs.process_one_job())
+
+        self.assertEqual(len(commands), 2)
+        self.assertEqual(commands[0]["idempotency_key"], commands[1]["idempotency_key"])
+        with self.test_pool.connection() as conn:
+            action = conn.execute(
+                "SELECT success FROM actions WHERE id = %s", (action_id,)
+            ).fetchone()
+            job = conn.execute(
+                "SELECT status, attempts FROM action_jobs WHERE action_id = %s AND operation = 'execute'",
+                (action_id,),
+            ).fetchone()
+            recommendation = conn.execute(
+                "SELECT status FROM recommendations WHERE id = %s",
+                (recommendation_id,),
+            ).fetchone()
+        self.assertTrue(action["success"])
+        self.assertEqual(job["status"], "succeeded")
+        self.assertEqual(job["attempts"], 2)
+        self.assertEqual(recommendation["status"], "executed")
 
     def _create_expired_action(self):
         recommendation_id = self._create_recommendation()
@@ -480,64 +686,23 @@ class WorkflowConcurrencyTests(unittest.TestCase):
 
     def test_manual_revert_and_expiry_worker_do_not_revert_twice(self):
         action_id = self._create_expired_action()
-        revert_started = threading.Event()
-        release_revert = threading.Event()
         revert_calls = []
 
         def revert_action(executor, command):
             revert_calls.append((executor, command))
-            revert_started.set()
-            if not release_revert.wait(timeout=5):
-                raise TimeoutError("Test did not release the simulated revert")
             return True, "Test revert completed"
 
-        def manual_revert():
-            try:
-                return self.actions.revert_action(
-                    action_id,
-                    self.actions.DecisionIn(),
-                    {"id": self.user_id, "role": "tier2"},
-                )
-            except HTTPException as error:
-                return error
+        self.expiry._revert_expired_once()
+        with self.assertRaises(HTTPException) as error:
+            self.actions.revert_action(
+                action_id,
+                self.actions.DecisionIn(),
+                {"id": self.user_id, "role": "tier2"},
+            )
+        self.assertEqual(error.exception.status_code, 409)
 
-        manual_started = threading.Event()
-        original_pool = self.actions.pool
-
-        class ManualStartConnection:
-            def __init__(self, connection):
-                self.connection = connection
-
-            def execute(self, query, *args, **kwargs):
-                if "from actions a" in str(query).lower():
-                    manual_started.set()
-                return self.connection.execute(query, *args, **kwargs)
-
-            def __getattr__(self, name):
-                return getattr(self.connection, name)
-
-        class ManualStartPool:
-            @contextmanager
-            def connection(self):
-                with original_pool.connection() as connection:
-                    yield ManualStartConnection(connection)
-
-        with patch.object(self.expiry.adapters, "revert", side_effect=revert_action):
-            with ThreadPoolExecutor(max_workers=2) as executor:
-                expiry_future = executor.submit(self.expiry._revert_expired_once)
-                self.assertTrue(revert_started.wait(timeout=5))
-                self.actions.pool = ManualStartPool()
-                manual_future = executor.submit(manual_revert)
-                try:
-                    self.assertTrue(manual_started.wait(timeout=5))
-                finally:
-                    release_revert.set()
-                    self.actions.pool = self.test_pool
-                expiry_future.result(timeout=10)
-                manual_result = manual_future.result(timeout=10)
-
-        self.assertIsInstance(manual_result, HTTPException)
-        self.assertEqual(manual_result.status_code, 409)
+        with patch.object(self.action_jobs.adapters, "revert", side_effect=revert_action):
+            self.assertTrue(self.action_jobs.process_one_job())
         self.assertEqual(len(revert_calls), 1)
 
         with self.test_pool.connection() as conn:
@@ -548,7 +713,12 @@ class WorkflowConcurrencyTests(unittest.TestCase):
         self.assertIsNotNone(row["reverted_at"])
 
     def test_expiry_workers_skip_actions_claimed_by_another_worker(self):
-        self._create_expired_action()
+        action_id = self._create_expired_action()
+        with self.test_pool.connection() as conn:
+            conn.execute(
+                "INSERT INTO action_jobs (action_id, operation) VALUES (%s, 'revert')",
+                (action_id,),
+            )
         revert_started = threading.Event()
         release_revert = threading.Event()
         revert_calls = []
@@ -560,12 +730,12 @@ class WorkflowConcurrencyTests(unittest.TestCase):
                 raise TimeoutError("Test did not release the simulated revert")
             return True, "Test revert completed"
 
-        with patch.object(self.expiry.adapters, "revert", side_effect=revert_action):
+        with patch.object(self.action_jobs.adapters, "revert", side_effect=revert_action):
             with ThreadPoolExecutor(max_workers=2) as executor:
-                first = executor.submit(self.expiry._revert_expired_once)
+                first = executor.submit(self.action_jobs.process_one_job)
                 self.assertTrue(revert_started.wait(timeout=5))
-                second = executor.submit(self.expiry._revert_expired_once)
-                second.result(timeout=5)
+                second = executor.submit(self.action_jobs.process_one_job)
+                self.assertFalse(second.result(timeout=5))
                 release_revert.set()
                 first.result(timeout=10)
 
