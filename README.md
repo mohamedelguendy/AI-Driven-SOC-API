@@ -65,8 +65,9 @@ back-end/
    ```
 4. **Create your `.env`:** copy `.env.example` to `.env` and replace the
    placeholders. `JWT_SECRET`, `INGEST_API_KEY`, and `AI_API_KEY` must each be
-   at least 32 characters; generate separate random values for them. The two
-   threat-intel keys are optional.
+   at least 32 characters; generate separate, unique random values for them.
+   `JWT_EXPIRE_MINUTES` must be between 1 and 1440. The two threat-intel keys
+   are optional.
 5. **Start the database:**
    ```bash
    docker compose up -d

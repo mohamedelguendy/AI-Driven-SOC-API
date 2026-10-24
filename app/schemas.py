@@ -30,7 +30,7 @@ class RecommendationIn(BaseModel):
  
     The AI proposes; it never decides impact or executes anything itself.
     """
- 
+
     incident_id: int = Field(gt=0)
     action_type: str = Field(min_length=1, max_length=100)  # 'block_ip', 'block_port', 'isolate_host', 'unisolate_host', ...
     executor: Literal["firewall", "edr"]

@@ -1,3 +1,4 @@
+import hmac
 from datetime import datetime, timedelta, timezone
  
 import jwt
@@ -14,9 +15,15 @@ def hash_password(password: str) -> str:
  
 def verify_password(password: str, hashed: str) -> bool:
     return _hasher.verify(password, hashed)
- 
- 
- 
+
+
+def verify_api_key(candidate: str | None, expected: str) -> bool:
+    """Compare API credentials without leaking a timing signal."""
+    if candidate is None:
+        return False
+    return hmac.compare_digest(candidate.encode("utf-8"), expected.encode("utf-8"))
+
+
 def create_access_token(user_id: int) -> str:
     expires = datetime.now(timezone.utc) + timedelta(minutes=settings.jwt_expire_minutes)
     # The role is deliberately NOT stored in the token. It is read from the

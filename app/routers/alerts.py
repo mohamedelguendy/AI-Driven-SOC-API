@@ -8,6 +8,7 @@ from ..config import settings
 from ..db import pool
 from ..deps import get_current_user
 from ..schemas import AlertIn
+from ..security import verify_api_key
 
 router = APIRouter(prefix="/alerts", tags=["alerts"])
 
@@ -25,7 +26,7 @@ def _check_ingest_key(x_api_key: str | None = Header(default=None)):
     Separate from user login (/auth/login) on purpose: the SIEM is a
     service, not a person with a tier2/tier3/admin role.
     """
-    if x_api_key != settings.ingest_api_key:
+    if not verify_api_key(x_api_key, settings.ingest_api_key):
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 

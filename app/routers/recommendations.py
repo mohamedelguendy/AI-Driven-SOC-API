@@ -8,6 +8,7 @@ from ..config import settings
 from ..db import pool
 from ..deps import get_current_user, require_roles
 from ..schemas import DecisionIn, RecommendationIn
+from ..security import verify_api_key
 
 router = APIRouter(prefix="/recommendations", tags=["recommendations"])
 
@@ -17,7 +18,7 @@ def _check_ai_key(x_api_key: str | None = Header(default=None)):
     the SIEM ingest key and from user logins — three different callers,
     three different credentials.
     """
-    if x_api_key != settings.ai_api_key:
+    if not verify_api_key(x_api_key, settings.ai_api_key):
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 

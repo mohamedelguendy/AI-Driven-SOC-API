@@ -1,6 +1,6 @@
 from ipaddress import ip_network
 
-from pydantic import field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -9,7 +9,7 @@ class Settings(BaseSettings):
 
     database_url: str
     jwt_secret: str
-    jwt_expire_minutes: int = 60
+    jwt_expire_minutes: int = Field(default=60, gt=0, le=1440)
     ingest_api_key: str   # used by the security team's pipeline, not user logins
     ai_api_key: str       # used by the AI SOC Engineer to submit recommendations
     internal_network_cidrs: str = "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
@@ -19,6 +19,13 @@ class Settings(BaseSettings):
     # instead of failing.
     virustotal_api_key: str | None = None
     abuseipdb_api_key: str | None = None
+
+    @model_validator(mode="after")
+    def validate_distinct_application_secrets(self):
+        secrets = (self.jwt_secret, self.ingest_api_key, self.ai_api_key)
+        if len(set(secrets)) != len(secrets):
+            raise ValueError("JWT_SECRET, INGEST_API_KEY, and AI_API_KEY must be different values")
+        return self
 
     @field_validator("jwt_secret", "ingest_api_key", "ai_api_key")
     @classmethod
