@@ -1,24 +1,28 @@
-from typing import Literal
+from ipaddress import ip_network
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+FIREWALL_ACTION_TYPES = ("block_ip", "block_port")
 
 
 class AlertIn(BaseModel):
     """What the security team's pipeline sends us.
- 
-    Deliberately loose: almost everything is optional. A missing or
-    malformed field must never cause a rejected event — see alerts.py.
+
+    Deliberately loose: every field is optional and untyped. A missing or
+    malformed field must never cause a rejected event — alerts.py
+    validates each one and records what it could not parse.
     """
- 
+
     model_config = ConfigDict(extra="allow")
 
-    source: str  # 'siem', 'ids', 'edr', 'firewall', 'webapp'
-    event_time: str | None = None
-    src_ip: str | None = None
-    dst_ip: str | None = None
-    hostname: str | None = None
-    signature: str | None = None
-    severity: int | None = None
+    source: Any = None  # 'siem', 'ids', 'edr', 'firewall', 'webapp'
+    event_time: Any = None
+    src_ip: Any = None
+    dst_ip: Any = None
+    hostname: Any = None
+    signature: Any = None
+    severity: Any = None
 
 
 class NoteIn(BaseModel):
@@ -27,7 +31,7 @@ class NoteIn(BaseModel):
 
 class RecommendationIn(BaseModel):
     """What the AI SOC Engineer sends when it wants an action taken.
- 
+
     The AI proposes; it never decides impact or executes anything itself.
     """
 
@@ -41,6 +45,36 @@ class RecommendationIn(BaseModel):
     reason: str = Field(min_length=1, max_length=10_000)
     risk_score: int | None = Field(default=None, ge=0, le=100)
 
+    @model_validator(mode="after")
+    def normalize_firewall_target(self):
+        """For firewall actions the backend, not the AI, decides what the
+        target is and what scope it has. A target that can't be parsed is
+        rejected rather than treated as external: otherwise it would skip
+        the internal-network and protected-target checks.
+        """
+        if self.executor != "firewall":
+            return self
+
+        if self.action_type == "block_ip":
+            try:
+                network = ip_network(self.target_value.strip(), strict=False)
+            except ValueError:
+                raise ValueError("block_ip target_value must be an IP address or CIDR") from None
+            if network.num_addresses == 1:
+                self.target_scope, self.target_value = "single_ip", str(network.network_address)
+            else:
+                self.target_scope, self.target_value = "subnet", str(network)
+        elif self.action_type == "block_port":
+            port = self.target_value.strip()
+            if not (port.isascii() and port.isdigit() and 1 <= int(port) <= 65535):
+                raise ValueError("block_port target_value must be a port number from 1 to 65535")
+            self.target_scope, self.target_value = "port", str(int(port))
+        else:
+            raise ValueError(
+                "firewall action_type must be one of: " + ", ".join(FIREWALL_ACTION_TYPES)
+            )
+        return self
+
 
 class DecisionIn(BaseModel):
     """Optional note when approving/rejecting a recommendation."""
@@ -53,4 +87,3 @@ class TriageIn(BaseModel):
 
     confirmed: bool
     reason: str | None = Field(default=None, max_length=10_000)  # why it's a false positive, if not confirmed
- 

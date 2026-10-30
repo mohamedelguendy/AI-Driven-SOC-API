@@ -30,6 +30,7 @@ back-end/
     action_jobs.py            # durable, retryable execution/revert worker
     adapters/
       firewall.py             # simulated firewall execute()/revert()
+      meraki.py               # Cisco Meraki MX firewall execute()/revert()
       edr.py                  # simulated EDR execute()/revert()
     routers/
       auth.py                  # POST /auth/login, GET /auth/me
@@ -67,7 +68,10 @@ back-end/
    placeholders. `JWT_SECRET`, `INGEST_API_KEY`, and `AI_API_KEY` must each be
    at least 32 characters; generate separate, unique random values for them.
    `JWT_EXPIRE_MINUTES` must be between 1 and 1440. The two threat-intel keys
-   are optional.
+   are optional. Set `POSTGRES_PASSWORD` and use the same password in
+   `DATABASE_URL`; Docker Compose reads it from `.env`. Keep the host as
+   `127.0.0.1`: the database only listens on IPv4 loopback, and `localhost`
+   can resolve to IPv6 first and hang.
 5. **Start the database:**
    ```bash
    docker compose up -d
@@ -101,7 +105,8 @@ an isolated schema. Set `TEST_DATABASE_URL` to a disposable
 PostgreSQL database before running them; do not point it at production:
 
 ```powershell
-$env:TEST_DATABASE_URL = "postgresql://<db-user>:<db-password>@<db-host>:5432/soc_test"
+docker exec soc_db psql -U soc -d soc -c "CREATE DATABASE soc_test OWNER soc"   # once
+$env:TEST_DATABASE_URL = "postgresql://soc:<POSTGRES_PASSWORD>@127.0.0.1:5432/soc_test"
 python -m unittest discover -s tests -v
 ```
 
@@ -158,10 +163,40 @@ them with the comma-separated `INTERNAL_NETWORK_CIDRS` setting.
 Suricata's own events — that double-ingests Suricata alerts. See the
 docstring in `ingest_ids_engine.py`.
 
+## Cisco Meraki firewall
+
+Set `FIREWALL_MODE=meraki` to send approved firewall actions to Meraki MX
+appliances through the Dashboard API instead of simulating them:
+
+| Setting | Purpose |
+|---|---|
+| `MERAKI_API_KEY` | Dashboard API key of an account with write access to the networks below |
+| `MERAKI_NETWORK_IDS` | Comma-separated network IDs that blocks are applied to |
+| `MERAKI_BLOCK_INBOUND` | `true` also adds deny rules to the MX inbound firewall rules |
+
+Supported firewall actions (any other `action_type` is rejected with 422):
+
+- `block_ip` (IP or CIDR): deny rule at the top of the L3 outbound rules with
+  the target as destination and, if inbound blocking is on, in the inbound
+  rules with the target as source. Single IPs are scored as `single_ip`,
+  ranges as `subnet`, whatever the AI claims.
+- `block_port` (1-65535): TCP and UDP deny rules for that destination port.
+
+Every rule's comment contains `[soc-action-<id>]`. Retries never add a rule
+twice, and a revert (manual or on expiry) removes only rules with that tag,
+never rules created by hand in the Dashboard. Don't edit tagged rules by hand
+while the action is active, and don't change `MERAKI_BLOCK_INBOUND` while
+actions are active (reverts only clean the rule sets currently enabled).
+
+Meraki replaces a network's whole rule list on each update. The backend
+serializes its own updates per network, but a Dashboard edit made at the same
+moment can still be overwritten. Try it on a test network first.
+
 ## Status
 
-Firewall/EDR execution is currently simulated (logged, not sent to a real
-device) — pending access details from the security team. Approvals and
+EDR execution is currently simulated (logged, not sent to a real device)
+— pending access details from the security team. Firewall execution is
+simulated unless `FIREWALL_MODE=meraki`. Approvals and
 reversions are durable queued jobs; the worker retries failures up to eight
 times with exponential backoff and renews its database lease while an adapter
 call is active. A failed reversal can be retried by calling the same revert

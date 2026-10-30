@@ -89,6 +89,7 @@ def _job_command(job: dict) -> tuple[str, dict]:
             "action_type": action["action_type"],
             "target": action["target_value"],
             "executor": action["executor"],
+            "action_id": job["action_id"],
             "idempotency_key": f"soc-action-{job['action_id']}-{job['operation']}",
         }
     )
@@ -130,13 +131,23 @@ def _finish_job(job: dict, success: bool, message: str) -> None:
 
         if job["operation"] == "execute":
             if success or not retry:
+                # A temporary action's clock starts when it actually takes
+                # effect, not at approval: retries can delay execution.
                 conn.execute(
                     """
-                    UPDATE actions
-                    SET success = %s, result_message = %s
-                    WHERE id = %s
+                    UPDATE actions a
+                    SET success = %s,
+                        result_message = %s,
+                        executed_at = CASE WHEN %s THEN now() ELSE a.executed_at END,
+                        expires_at = CASE
+                            WHEN %s AND NOT r.is_permanent
+                            THEN now() + r.duration_secs * interval '1 second'
+                            ELSE a.expires_at
+                        END
+                    FROM recommendations r
+                    WHERE a.id = %s AND r.id = a.recommendation_id
                     """,
-                    (success, message, job["action_id"]),
+                    (success, message, success, success, job["action_id"]),
                 )
                 conn.execute(
                     "UPDATE recommendations SET status = %s WHERE id = "

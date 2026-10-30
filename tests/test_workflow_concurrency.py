@@ -958,6 +958,96 @@ class WorkflowConcurrencyTests(unittest.TestCase):
 
         self.assertEqual(len(revert_calls), 1)
 
+    def _set_incident_status(self, status):
+        with self.test_pool.connection() as conn:
+            conn.execute(
+                "UPDATE incidents SET status = %s WHERE id = %s", (status, self.incident_id)
+            )
+
+    def _incident_status(self):
+        with self.test_pool.connection() as conn:
+            return conn.execute(
+                "SELECT status FROM incidents WHERE id = %s", (self.incident_id,)
+            ).fetchone()["status"]
+
+    def test_adding_a_note_does_not_skip_triage(self):
+        from app.schemas import NoteIn
+
+        self.incidents.add_note(
+            self.incident_id,
+            NoteIn(body="Looking into it"),
+            {"id": self.user_id, "role": "tier1"},
+        )
+
+        self.assertEqual(self._incident_status(), "new")
+
+    def test_malformed_alert_fields_are_stored_with_notes(self):
+        result = self.alerts.ingest_alert(
+            AlertIn(severity="high", src_ip=12345, hostname="ws-01"), None
+        )
+
+        self.assertEqual(result["parse_status"], "partial")
+        self.assertEqual(len(result["parse_notes"]), 3)  # missing source, bad IP, bad severity
+
+    def test_temporary_action_expiry_starts_when_execution_succeeds(self):
+        from datetime import timedelta
+
+        recommendation_id = self._create_recommendation()
+        response = self.recommendations.approve(
+            recommendation_id,
+            self.recommendations.DecisionIn(),
+            {"id": self.user_id, "role": "tier2"},
+        )
+        action_id = response["action"]["id"]
+        self.assertIsNone(response["action"]["expires_at"])
+
+        with patch.object(
+            self.action_jobs.adapters, "execute", return_value=(True, "Test action completed")
+        ):
+            self.assertTrue(self.action_jobs.process_one_job())
+
+        with self.test_pool.connection() as conn:
+            action = conn.execute(
+                "SELECT success, expires_at - executed_at AS duration FROM actions WHERE id = %s",
+                (action_id,),
+            ).fetchone()
+        self.assertTrue(action["success"])
+        self.assertEqual(action["duration"], timedelta(seconds=60))
+
+    def test_actions_cannot_be_approved_for_finished_incidents(self):
+        recommendation_id = self._create_recommendation()
+        self._set_incident_status("resolved")
+
+        with self.assertRaises(HTTPException) as error:
+            self.recommendations.approve(
+                recommendation_id,
+                self.recommendations.DecisionIn(),
+                {"id": self.user_id, "role": "tier3"},
+            )
+
+        self.assertEqual(error.exception.status_code, 409)
+        with self.test_pool.connection() as conn:
+            status = conn.execute(
+                "SELECT status FROM recommendations WHERE id = %s", (recommendation_id,)
+            ).fetchone()["status"]
+        self.assertEqual(status, "pending")
+
+    def test_approved_action_moves_escalated_incident_to_in_response(self):
+        recommendation_id = self._create_recommendation()
+        self._set_incident_status("escalated")
+
+        self.recommendations.approve(
+            recommendation_id,
+            self.recommendations.DecisionIn(),
+            {"id": self.user_id, "role": "tier3"},
+        )
+
+        self.assertEqual(self._incident_status(), "in_response")
+        with patch.object(
+            self.action_jobs.adapters, "execute", return_value=(True, "Test action completed")
+        ):
+            self.assertTrue(self.action_jobs.process_one_job())
+
 
 if __name__ == "__main__":
     unittest.main()

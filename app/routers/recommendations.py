@@ -1,5 +1,5 @@
-from datetime import datetime, timedelta, timezone
 from ipaddress import ip_network
+from typing import Literal
 
 from fastapi import APIRouter, Depends, Header, HTTPException
 from psycopg.types.json import Jsonb
@@ -11,6 +11,8 @@ from ..schemas import DecisionIn, RecommendationIn
 from ..security import verify_api_key
 
 router = APIRouter(prefix="/recommendations", tags=["recommendations"])
+
+FINISHED_INCIDENT_STATUSES = ("resolved", "closed")
 
 
 def _check_ai_key(x_api_key: str | None = Header(default=None)):
@@ -115,6 +117,18 @@ def _find_pending_action(conn, target_value: str, action_type: str, executor: st
     ).fetchone()
 
 
+def _mark_in_response(conn, incident_id: int) -> None:
+    """An approved action on an escalated incident means tier 3 is now
+    responding to it."""
+    conn.execute(
+        """
+        UPDATE incidents SET status = 'in_response', updated_at = now()
+        WHERE id = %s AND status = 'escalated'
+        """,
+        (incident_id,),
+    )
+
+
 @router.post("", dependencies=[Depends(_check_ai_key)])
 def create_recommendation(rec: RecommendationIn):
     """The AI submits a recommendation. It is stored as pending and
@@ -133,10 +147,15 @@ def create_recommendation(rec: RecommendationIn):
             )
 
         incident = conn.execute(
-            "SELECT id FROM incidents WHERE id = %s", (rec.incident_id,)
+            "SELECT id, status FROM incidents WHERE id = %s", (rec.incident_id,)
         ).fetchone()
         if incident is None:
             raise HTTPException(status_code=404, detail="Incident not found")
+        if incident["status"] in FINISHED_INCIDENT_STATUSES:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Incident is already {incident['status']}; no new actions can be recommended",
+            )
 
         row = conn.execute(
             """
@@ -169,11 +188,25 @@ def create_recommendation(rec: RecommendationIn):
             (row["id"], Jsonb({"impact": impact, "action_type": rec.action_type})),
         )
 
+        if rec.risk_score is not None:
+            # Keeps the incident queue ordered by the highest risk reported so far.
+            conn.execute(
+                """
+                UPDATE incidents
+                SET risk_score = GREATEST(COALESCE(risk_score, 0), %s), updated_at = now()
+                WHERE id = %s
+                """,
+                (rec.risk_score, rec.incident_id),
+            )
+
     return row
 
 
 @router.get("")
-def list_recommendations(status: str | None = None, user: dict = Depends(get_current_user)):
+def list_recommendations(
+    status: Literal["pending", "approved", "rejected", "executed", "failed", "expired"] | None = None,
+    user: dict = Depends(get_current_user),
+):
     query = "SELECT * FROM recommendations"
     params: tuple = ()
     if status:
@@ -200,6 +233,15 @@ def approve(
             raise HTTPException(status_code=404, detail="Recommendation not found")
         if rec["status"] != "pending":
             raise HTTPException(status_code=409, detail=f"Already {rec['status']}")
+
+        incident = conn.execute(
+            "SELECT status FROM incidents WHERE id = %s", (rec["incident_id"],)
+        ).fetchone()
+        if incident["status"] in FINISHED_INCIDENT_STATUSES:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Incident is already {incident['status']}; reject this recommendation instead",
+            )
 
         # The core rule: tier2 can approve low-impact only, tier3/admin can approve any.
         if rec["impact"] == "high" and user["role"] not in ("tier3", "admin"):
@@ -268,22 +310,20 @@ def approve(
                 """,
                 (user["id"], rec_id, Jsonb({"action_id": existing["id"]})),
             )
+            _mark_in_response(conn, rec["incident_id"])
             return {
                 "recommendation_id": rec_id,
                 "status": "already_active",
                 "action": existing,
             }
 
-        expires_at = None
-        if not rec["is_permanent"]:
-            expires_at = datetime.now(timezone.utc) + timedelta(seconds=rec["duration_secs"])
-
+        # expires_at stays NULL until the execution succeeds (see action_jobs).
         action = conn.execute(
             """
             INSERT INTO actions
                 (recommendation_id, executor, command, success, result_message,
-                 executed_by, expires_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
+                 executed_by)
+            VALUES (%s, %s, %s, %s, %s, %s)
             RETURNING *
             """,
             (
@@ -293,7 +333,6 @@ def approve(
                 None,
                 "Execution queued",
                 user["id"],
-                expires_at,
             ),
         ).fetchone()
 
@@ -304,6 +343,7 @@ def approve(
             """,
             (action["id"], user["id"]),
         )
+        _mark_in_response(conn, rec["incident_id"])
 
     return {
         "recommendation_id": rec_id,

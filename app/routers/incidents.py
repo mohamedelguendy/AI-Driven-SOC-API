@@ -156,13 +156,6 @@ def add_note(
             (incident_id, user["id"], note.body),
         ).fetchone()
 
-        if incident_id is not None:
-            conn.execute(
-                "UPDATE incidents SET status = 'investigating', updated_at = now() "
-                "WHERE id = %s AND status = 'new'",
-                (incident_id,),
-            )
-
         conn.execute(
             """
             INSERT INTO audit_log (actor_type, actor_id, event_type, entity_type, entity_id)

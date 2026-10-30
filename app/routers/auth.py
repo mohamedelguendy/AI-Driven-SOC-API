@@ -1,4 +1,5 @@
 import hashlib
+import secrets
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -8,12 +9,16 @@ from psycopg.types.json import Jsonb
 
 from ..db import pool
 from ..deps import get_current_user
-from ..security import create_access_token, verify_password
+from ..security import create_access_token, hash_password, verify_password
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 LOGIN_ATTEMPT_LIMIT = 10
 LOGIN_WINDOW = timedelta(minutes=15)
+
+# Checked against when the username doesn't exist, so a failed login takes
+# the same time either way and doesn't reveal which usernames are real.
+_TIMING_DUMMY_HASH = hash_password(secrets.token_urlsafe(32))
 
 
 def _login_bucket_keys(username: str, client_ip: str) -> tuple[str, str]:
@@ -84,11 +89,11 @@ def login(request: Request, form: OAuth2PasswordRequestForm = Depends()):  # noq
                 (form.username,),
             ).fetchone()
 
-            ok = (
-                user is not None
-                and user["is_active"]
-                and verify_password(form.password, user["password_hash"])
+            password_ok = verify_password(
+                form.password,
+                user["password_hash"] if user else _TIMING_DUMMY_HASH,
             )
+            ok = user is not None and user["is_active"] and password_ok
 
             if ok:
                 conn.execute(

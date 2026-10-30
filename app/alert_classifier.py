@@ -5,6 +5,7 @@ tier1 a starting suggestion (classification, severity, priority, risk
 score) before they make the real call. Nothing in this file writes to
 the database or changes anything on its own; it only suggests.
 """
+import re
 from typing import Any
 
 
@@ -30,7 +31,9 @@ def analyze_event(event: dict[str, Any]) -> dict[str, Any]:
             "Correlate source IP activity across destination ports and hosts; "
             "confirm whether the scan was authorized before taking action."
         )
-    elif any(term in signature for term in ("trojan", "malware", "command and control", "c2")):
+    elif any(term in signature for term in ("trojan", "malware", "command and control")) or re.search(
+        r"\bc2\b", signature  # whole word only, so e.g. "ec2" doesn't match
+    ):
         classification = "POTENTIAL_MALWARE_ACTIVITY"
         severity, priority, confidence, risk_score = "HIGH", "P2", 0.75, 80
         evidence.append(f"Potential malware-related signature: {event.get('signature')}")

@@ -1,12 +1,12 @@
 from datetime import datetime, timezone
 from ipaddress import ip_address
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Header
 from psycopg.types.json import Jsonb
 
 from ..config import settings
 from ..db import pool
-from ..deps import get_current_user
 from ..schemas import AlertIn
 from ..security import verify_api_key
 
@@ -19,6 +19,9 @@ VALID_SOURCES = {"siem", "ids", "edr", "firewall", "webapp"}
 # without needing real correlation logic yet.
 CORRELATION_WINDOW_MINUTES = 30
 
+# Incident severity runs 1 (most severe) to 5. Used when an alert has none.
+DEFAULT_INCIDENT_SEVERITY = 3
+
 
 def _check_ingest_key(x_api_key: str | None = Header(default=None)):
     """Machine-to-machine auth for the security team's pipeline.
@@ -30,21 +33,23 @@ def _check_ingest_key(x_api_key: str | None = Header(default=None)):
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 
-def _safe_ip(value: str | None) -> tuple[str | None, str | None]:
+def _safe_ip(value: Any) -> tuple[str | None, str | None]:
     """Returns (valid_ip_or_None, note_if_invalid)."""
-    if not value:
+    if value is None or value == "":
         return None, None
     try:
-        ip_address(value)
+        ip_address(value if isinstance(value, str) else "")
         return value, None
     except ValueError:
         return None, f'"{value}" is not a valid IP'
 
 
-def _safe_time(value: str | None) -> tuple[datetime | None, str | None]:
-    if not value:
+def _safe_time(value: Any) -> tuple[datetime | None, str | None]:
+    if value is None or value == "":
         return None, None
     try:
+        if not isinstance(value, str):
+            raise ValueError
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
         if parsed.tzinfo is None:
             parsed = parsed.replace(tzinfo=timezone.utc)
@@ -53,19 +58,43 @@ def _safe_time(value: str | None) -> tuple[datetime | None, str | None]:
         return None, f'"{value}" is not a valid ISO timestamp'
 
 
+def _safe_severity(value: Any) -> tuple[int | None, str | None]:
+    if value is None:
+        return None, None
+    if isinstance(value, str) and value.strip().lstrip("-").isascii() and value.strip().lstrip("-").isdigit():
+        value = int(value.strip())
+    if type(value) is not int:  # bool is excluded on purpose
+        return None, f'severity "{value}" is not an integer'
+    if not -32768 <= value <= 32767:
+        return None, f'severity "{value}" is outside the supported integer range'
+    return value, None
+
+
+def _safe_text(value: Any) -> str | None:
+    if value is None or isinstance(value, str):
+        return value
+    return str(value)
+
+
 @router.post("/ingest", dependencies=[Depends(_check_ingest_key)])
 def ingest_alert(
     alert: AlertIn,
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ):
-    """Receive one security event. Never rejects a payload outright —
-    always stores raw_event, and marks what it could not parse.
+    """Receive one security event. Never rejects a payload for missing or
+    malformed fields — always stores raw_event, and marks what it could
+    not parse.
     """
     notes: list[str] = []
 
-    source = alert.source if alert.source in VALID_SOURCES else None
-    if source is None:
-        notes.append(f'unknown source "{alert.source}", defaulting to "siem"')
+    if isinstance(alert.source, str) and alert.source in VALID_SOURCES:
+        source = alert.source
+    else:
+        notes.append(
+            "missing source, defaulting to \"siem\""
+            if alert.source is None
+            else f'unknown source "{alert.source}", defaulting to "siem"'
+        )
         source = "siem"
 
     event_time, note = _safe_time(alert.event_time)
@@ -80,15 +109,14 @@ def ingest_alert(
     if note:
         notes.append(note)
 
-    severity = (
-        alert.severity
-        if type(alert.severity) is int and -32768 <= alert.severity <= 32767
-        else None
-    )
-    if alert.severity is not None and severity is None:
-        notes.append(f'severity "{alert.severity}" is outside the supported integer range')
+    severity, note = _safe_severity(alert.severity)
+    if note:
+        notes.append(note)
 
-    parse_status = "failed" if not any([event_time, src_ip, dst_ip, alert.hostname]) else (
+    hostname = _safe_text(alert.hostname)
+    signature = _safe_text(alert.signature)
+
+    parse_status = "failed" if not any([event_time, src_ip, dst_ip, hostname]) else (
         "partial" if notes else "ok"
     )
     if idempotency_key is not None:
@@ -97,6 +125,10 @@ def ingest_alert(
         raise HTTPException(status_code=422, detail="Idempotency-Key must not be empty")
     if idempotency_key is not None and len(idempotency_key) > 255:
         raise HTTPException(status_code=422, detail="Idempotency-Key must be 255 characters or fewer")
+
+    incident_severity = (
+        min(max(severity, 1), 5) if severity is not None else DEFAULT_INCIDENT_SEVERITY
+    )
 
     with pool.connection() as conn:
         if idempotency_key:
@@ -139,7 +171,8 @@ def ingest_alert(
                     "duplicate": True,
                 }
 
-        # Correlate: attach to a recent open incident from the same src_ip,
+        # Correlate: attach to a recent unresolved incident from the same
+        # src_ip (including ones already escalated or in response),
         # otherwise open a new one.
         incident_id = None
         if src_ip:
@@ -152,7 +185,7 @@ def ingest_alert(
                 SELECT i.id FROM incidents i
                 JOIN alerts a ON a.incident_id = i.id
                 WHERE a.src_ip = %s
-                  AND i.status IN ('new', 'investigating')
+                  AND i.status IN ('new', 'investigating', 'escalated', 'in_response')
                   AND COALESCE(a.event_time, a.ingested_at) > now() - (%s || ' minutes')::interval
                   AND COALESCE(a.event_time, a.ingested_at) <= now() + interval '5 minutes'
                 ORDER BY COALESCE(a.event_time, a.ingested_at) DESC
@@ -162,6 +195,15 @@ def ingest_alert(
             ).fetchone()
             if row:
                 incident_id = row["id"]
+                if severity is not None:
+                    # A more severe alert raises the incident's severity (1 is most severe).
+                    conn.execute(
+                        """
+                        UPDATE incidents SET severity = %s, updated_at = now()
+                        WHERE id = %s AND severity > %s
+                        """,
+                        (incident_severity, incident_id, incident_severity),
+                    )
 
         if incident_id is None:
             incident = conn.execute(
@@ -171,8 +213,8 @@ def ingest_alert(
                 RETURNING id
                 """,
                 (
-                    alert.signature or f"{source} alert" + (f" from {src_ip}" if src_ip else ""),
-                    min(max(severity or 1, 1), 5),
+                    signature or f"{source} alert" + (f" from {src_ip}" if src_ip else ""),
+                    incident_severity,
                 ),
             ).fetchone()
             incident_id = incident["id"]
@@ -192,8 +234,8 @@ def ingest_alert(
                 event_time,
                 src_ip,
                 dst_ip,
-                alert.hostname,
-                alert.signature,
+                hostname,
+                signature,
                 severity,
                 parse_status,
                 "; ".join(notes) or None,

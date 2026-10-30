@@ -11,7 +11,7 @@ CREATE TYPE user_role AS ENUM ('tier1', 'tier2', 'tier3', 'admin');
 CREATE TYPE alert_source AS ENUM ('siem', 'ids', 'edr', 'firewall', 'webapp');
 
 CREATE TYPE incident_status AS ENUM (
-    'new',            -- created by correlation, waiting for tier 2
+    'new',            -- created by correlation, waiting for tier 1 triage
     'investigating',  -- tier 2 is working on it
     'escalated',      -- sent to tier 3
     'in_response',    -- tier 3 is acting on it

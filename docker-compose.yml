@@ -4,10 +4,11 @@ services:
     container_name: soc_db
     environment:
       POSTGRES_USER: soc
-      POSTGRES_PASSWORD: miko2003
+      # Read from .env (Docker Compose loads it automatically). Never commit it.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
       POSTGRES_DB: soc
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"  # reachable from this machine only
     volumes:
       - soc_data:/var/lib/postgresql/data
 

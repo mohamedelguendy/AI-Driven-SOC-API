@@ -1,11 +1,13 @@
 from ipaddress import ip_network
+from typing import Literal
 
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env")
+    # extra="ignore": .env is shared with docker-compose (POSTGRES_PASSWORD)
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     database_url: str
     jwt_secret: str
@@ -19,6 +21,27 @@ class Settings(BaseSettings):
     # instead of failing.
     virustotal_api_key: str | None = None
     abuseipdb_api_key: str | None = None
+
+    # Firewall integration. "simulated" only logs what would happen;
+    # "meraki" pushes deny rules to Cisco Meraki MX networks.
+    firewall_mode: Literal["simulated", "meraki"] = "simulated"
+    meraki_api_key: str | None = None
+    meraki_network_ids: str = ""  # comma-separated, e.g. "L_123,N_456"
+    meraki_base_url: str = "https://api.meraki.com/api/v1"
+    meraki_block_inbound: bool = False
+
+    @property
+    def meraki_network_id_list(self) -> list[str]:
+        return [n.strip() for n in self.meraki_network_ids.split(",") if n.strip()]
+
+    @model_validator(mode="after")
+    def validate_meraki_settings(self):
+        if self.firewall_mode == "meraki":
+            if not self.meraki_api_key:
+                raise ValueError("MERAKI_API_KEY is required when FIREWALL_MODE=meraki")
+            if not self.meraki_network_id_list:
+                raise ValueError("MERAKI_NETWORK_IDS is required when FIREWALL_MODE=meraki")
+        return self
 
     @model_validator(mode="after")
     def validate_distinct_application_secrets(self):
@@ -37,7 +60,7 @@ class Settings(BaseSettings):
             raise ValueError("must be replaced with a randomly generated secret")
         return value.strip()
 
-    @field_validator("virustotal_api_key", "abuseipdb_api_key", mode="before")
+    @field_validator("virustotal_api_key", "abuseipdb_api_key", "meraki_api_key", mode="before")
     @classmethod
     def treat_disabled_provider_keys_as_unconfigured(cls, value: str | None) -> str | None:
         if isinstance(value, str) and value.strip().upper() == "DISABLED":
