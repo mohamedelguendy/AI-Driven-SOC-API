@@ -1,9 +1,10 @@
 import jwt
-from fastapi import Depends, HTTPException
+from fastapi import Depends, Header, HTTPException
 from fastapi.security import OAuth2PasswordBearer
 
+from .config import settings
 from .db import pool
-from .security import decode_access_token
+from .security import decode_access_token, verify_api_key
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
 
@@ -45,3 +46,15 @@ def require_roles(*roles: str):
         return user
 
     return checker
+
+
+
+
+# Authenticate the AI service independently of human users and alert feeders.
+def require_ai_key(x_api_key: str | None = Header(default=None)) -> None:
+    """Separate machine credential for the AI SOC Engineer. Kept apart from
+    the SIEM ingest key and from user logins — three different callers,
+    three different credentials.
+    """
+    if not verify_api_key(x_api_key, settings.ai_api_key):
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")

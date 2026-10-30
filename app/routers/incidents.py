@@ -36,7 +36,7 @@ def list_incidents(
 
 
 
-# Return one incident together with its alerts, notes, and proposals.
+# Return one incident together with its alerts, notes, L1 reports, and proposals.
 @router.get("/{incident_id}")
 def get_incident(incident_id: int, user: dict = Depends(get_current_user)):
     with pool.connection() as conn:
@@ -58,6 +58,10 @@ def get_incident(incident_id: int, user: dict = Depends(get_current_user)):
             """,
             (incident_id,),
         ).fetchall()
+        l1_reports = conn.execute(
+            "SELECT * FROM l1_reports WHERE incident_id = %s ORDER BY created_at",
+            (incident_id,),
+        ).fetchall()
         recommendations = conn.execute(
             "SELECT * FROM recommendations WHERE incident_id = %s ORDER BY created_at",
             (incident_id,),
@@ -67,8 +71,74 @@ def get_incident(incident_id: int, user: dict = Depends(get_current_user)):
         "incident": incident,
         "alerts": alerts,
         "notes": notes,
+        "l1_reports": l1_reports,
         "recommendations": recommendations,
     }
+
+
+
+
+# Apply a one-time triage verdict inside the caller's transaction: route a
+# confirmed incident to tier 2, or close a false positive.
+def apply_triage(conn, incident_id: int, user_id: int, confirmed: bool, reason: str | None) -> dict:
+    """Shared by manual triage and by approving an L1 report."""
+    incident = conn.execute(
+        "SELECT * FROM incidents WHERE id = %s", (incident_id,)
+    ).fetchone()
+    if incident is None:
+        raise HTTPException(status_code=404, detail="Incident not found")
+    if incident["status"] != "new":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Incident is already in status '{incident['status']}' and cannot be triaged again",
+        )
+
+    if confirmed:
+        new_status = "investigating"
+        assigned_tier = "tier2"
+        summary = reason or "Confirmed as a real incident by triage review"
+    else:
+        new_status = "closed"
+        assigned_tier = None
+        summary = reason or "Dismissed as a false positive during triage"
+
+    row = conn.execute(
+        """
+        UPDATE incidents
+        SET status = %s,
+            assigned_tier = %s,
+            triaged_at = now(),
+            updated_at = now(),
+            resolved_at = CASE WHEN %s = 'closed' THEN now() ELSE resolved_at END
+        WHERE id = %s AND status = 'new'
+        RETURNING id, status, assigned_tier, updated_at
+        """,
+        (new_status, assigned_tier, new_status, incident_id),
+    ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=409, detail="Incident was triaged by another request")
+
+    conn.execute(
+        """
+        INSERT INTO incident_notes (incident_id, author_id, body)
+        VALUES (%s, %s, %s)
+        """,
+        (incident_id, user_id, f"Triage verdict: {'confirmed' if confirmed else 'dismissed'} - {summary}"),
+    )
+
+    conn.execute(
+        """
+        INSERT INTO audit_log (actor_type, actor_id, event_type, entity_type, entity_id, details)
+        VALUES ('user', %s, %s, 'incident', %s, %s)
+        """,
+        (
+            user_id,
+            "incident.triaged_confirmed" if confirmed else "incident.triaged_dismissed",
+            incident_id,
+            Jsonb({"confirmed": confirmed, "reason": reason}),
+        ),
+    )
+    return row
 
 
 
@@ -82,62 +152,7 @@ def triage_incident(
 ):
     """Tier 1 confirms whether an incident is real or a false positive."""
     with pool.connection() as conn:
-        incident = conn.execute(
-            "SELECT * FROM incidents WHERE id = %s", (incident_id,)
-        ).fetchone()
-        if incident is None:
-            raise HTTPException(status_code=404, detail="Incident not found")
-        if incident["status"] != "new":
-            raise HTTPException(
-                status_code=409,
-                detail=f"Incident is already in status '{incident['status']}' and cannot be triaged again",
-            )
-
-        if triage.confirmed:
-            new_status = "investigating"
-            assigned_tier = "tier2"
-            summary = triage.reason or "Confirmed as a real incident by triage review"
-        else:
-            new_status = "closed"
-            assigned_tier = None
-            summary = triage.reason or "Dismissed as a false positive during triage"
-
-        row = conn.execute(
-            """
-            UPDATE incidents
-            SET status = %s,
-                assigned_tier = %s,
-                triaged_at = now(),
-                updated_at = now(),
-                resolved_at = CASE WHEN %s = 'closed' THEN now() ELSE resolved_at END
-            WHERE id = %s AND status = 'new'
-            RETURNING id, status, assigned_tier, updated_at
-            """,
-            (new_status, assigned_tier, new_status, incident_id),
-        ).fetchone()
-        if row is None:
-            raise HTTPException(status_code=409, detail="Incident was triaged by another request")
-
-        conn.execute(
-            """
-            INSERT INTO incident_notes (incident_id, author_id, body)
-            VALUES (%s, %s, %s)
-            """,
-            (incident_id, user["id"], f"Triage verdict: {'confirmed' if triage.confirmed else 'dismissed'} - {summary}"),
-        )
-
-        conn.execute(
-            """
-            INSERT INTO audit_log (actor_type, actor_id, event_type, entity_type, entity_id, details)
-            VALUES ('user', %s, %s, 'incident', %s, %s)
-            """,
-            (
-                user["id"],
-                "incident.triaged_confirmed" if triage.confirmed else "incident.triaged_dismissed",
-                incident_id,
-                Jsonb({"confirmed": triage.confirmed, "reason": triage.reason}),
-            ),
-        )
+        row = apply_triage(conn, incident_id, user["id"], triage.confirmed, triage.reason)
 
     return {
         "incident_id": incident_id,

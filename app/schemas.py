@@ -1,9 +1,13 @@
-from ipaddress import ip_network
-from typing import Any, Literal
+from ipaddress import ip_address, ip_network
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 FIREWALL_ACTION_TYPES = ("block_ip", "block_port")
+Verdict = Literal["true_positive", "false_positive"]
+Confidence = Literal["low", "medium", "high"]
+ReportText = Annotated[str, Field(min_length=1, max_length=2000)]
+ActionText = Annotated[str, Field(min_length=1, max_length=500)]
 
 
 
@@ -102,3 +106,94 @@ class TriageIn(BaseModel):
 
     confirmed: bool
     reason: str | None = Field(default=None, max_length=10_000)  # why it's a false positive, if not confirmed
+
+
+
+
+# One observable from the incident: an IP, domain, file hash, port, account...
+class Indicator(BaseModel):
+    type: Literal["ip", "domain", "url", "hash", "port", "user", "hostname", "process"]
+    value: str = Field(min_length=1, max_length=500)
+
+    @model_validator(mode="after")
+    def normalize_value(self):
+        value = self.value.strip()
+        if self.type == "ip":
+            try:
+                value = str(ip_address(value))
+            except ValueError:
+                raise ValueError(f"'{self.value}' is not a valid IP address") from None
+        elif self.type == "port":
+            if not (value.isascii() and value.isdigit() and 1 <= int(value) <= 65535):
+                raise ValueError("port indicators must be a number from 1 to 65535")
+            value = str(int(value))
+        self.value = value
+        return self
+
+
+
+
+# A host or account touched by the incident, and how much it matters.
+class AffectedAsset(BaseModel):
+    hostname: str | None = Field(default=None, max_length=255)
+    ip: str | None = None
+    user: str | None = Field(default=None, max_length=255)
+    role: str | None = Field(default=None, max_length=255)  # e.g. "public web server"
+    criticality: Literal["low", "medium", "high", "critical"] | None = None
+
+    @model_validator(mode="after")
+    def require_identifier(self):
+        if not (self.hostname or self.ip or self.user):
+            raise ValueError("an affected asset needs a hostname, ip or user")
+        if self.ip:
+            try:
+                self.ip = str(ip_address(self.ip.strip()))
+            except ValueError:
+                raise ValueError(f"'{self.ip}' is not a valid IP address") from None
+        return self
+
+
+
+
+# The AI's draft of a tier 1 triage report; nothing changes until tier 1 approves it.
+class L1ReportIn(BaseModel):
+    incident_id: int = Field(gt=0)
+    verdict: Verdict
+    confidence: Confidence
+    severity: int = Field(ge=1, le=5)  # 1 = critical ... 5 = informational
+    summary: ReportText
+    affected_assets: list[AffectedAsset] = Field(default_factory=list, max_length=50)
+    indicators: list[Indicator] = Field(default_factory=list, max_length=100)
+    evidence_alert_ids: list[int] = Field(min_length=1, max_length=100)
+    recommended_actions: list[ActionText] = Field(default_factory=list, max_length=20)
+    escalation_reason: ReportText | None = None  # required for a true positive
+    false_positive_reason: ReportText | None = None  # required for a false positive
+
+    @model_validator(mode="after")
+    def require_reason_for_verdict(self):
+        if self.verdict == "true_positive" and not self.escalation_reason:
+            raise ValueError("a true_positive report needs an escalation_reason")
+        if self.verdict == "false_positive" and not self.false_positive_reason:
+            raise ValueError("a false_positive report needs a false_positive_reason")
+        return self
+
+
+
+
+# Tier 1's approval of a draft; any field set here replaces the AI's version.
+class L1ReviewIn(BaseModel):
+    verdict: Verdict | None = None
+    confidence: Confidence | None = None
+    severity: int | None = Field(default=None, ge=1, le=5)
+    summary: ReportText | None = None
+    escalation_reason: ReportText | None = None
+    false_positive_reason: ReportText | None = None
+    recommended_actions: list[ActionText] | None = Field(default=None, max_length=20)
+    comment: str | None = Field(default=None, max_length=10_000)
+
+
+
+
+# Sending a draft back: tier 1 must say what was wrong with it.
+class L1RejectIn(BaseModel):
+    comment: str = Field(min_length=1, max_length=10_000)

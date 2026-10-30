@@ -5,7 +5,7 @@ from fastapi import FastAPI
 
 from . import action_jobs, expiry
 from .db import pool
-from .routers import actions, alerts, analysis, auth, incidents, recommendations, threat_intel
+from .routers import actions, alerts, analysis, auth, incidents, l1_reports, recommendations, threat_intel
 
 
 
@@ -34,6 +34,7 @@ app = FastAPI(title="AI-Driven SOC API", lifespan=lifespan)
 app.include_router(auth.router)
 app.include_router(alerts.router)
 app.include_router(incidents.router)
+app.include_router(l1_reports.router)
 app.include_router(recommendations.router)
 app.include_router(actions.router)
 app.include_router(threat_intel.router)

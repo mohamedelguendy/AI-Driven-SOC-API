@@ -298,6 +298,7 @@ class WorkflowConcurrencyTests(unittest.TestCase):
                 "007_alert_ingest_idempotency.sql",
                 "008_action_job_leases.sql",
                 "009_evidence_and_triage_time.sql",
+                "010_l1_reports.sql",
             ):
                 migration_path = migration_dir / migration_name
                 conn.execute(migration_path.read_text(encoding="utf-8"), prepare=False)
@@ -316,7 +317,7 @@ class WorkflowConcurrencyTests(unittest.TestCase):
 
         import app.db as db_module
         from app import action_jobs, expiry
-        from app.routers import actions, alerts, auth, incidents, recommendations
+        from app.routers import actions, alerts, auth, incidents, l1_reports, recommendations
 
         cls.action_jobs = action_jobs
         cls.expiry = expiry
@@ -325,6 +326,7 @@ class WorkflowConcurrencyTests(unittest.TestCase):
         cls.auth = auth
         cls.incidents = incidents
         cls.recommendations = recommendations
+        cls.l1_reports = l1_reports
         cls.original_pools = {
             db_module: db_module.pool,
             action_jobs: action_jobs.pool,
@@ -334,6 +336,7 @@ class WorkflowConcurrencyTests(unittest.TestCase):
             auth: auth.pool,
             incidents: incidents.pool,
             recommendations: recommendations.pool,
+            l1_reports: l1_reports.pool,
         }
         atexit.register(db_module.pool.close)
         db_module.pool = cls.test_pool
@@ -344,6 +347,7 @@ class WorkflowConcurrencyTests(unittest.TestCase):
         auth.pool = cls.test_pool
         incidents.pool = cls.test_pool
         recommendations.pool = cls.test_pool
+        l1_reports.pool = cls.test_pool
 
     @classmethod
     def tearDownClass(cls):
@@ -1132,6 +1136,111 @@ class WorkflowConcurrencyTests(unittest.TestCase):
             with self.subTest(cited=cited), self.assertRaises(HTTPException) as error:
                 self.recommendations.create_recommendation(self._recommendation_citing(cited))
             self.assertEqual(error.exception.status_code, 422)
+
+    def _l1_report(self, verdict="true_positive"):
+        from app.schemas import L1ReportIn
+
+        with self.test_pool.connection() as conn:
+            alert_id = conn.execute(
+                """
+                INSERT INTO alerts (incident_id, source, src_ip, signature)
+                VALUES (%s, 'ids', %s, 'BRUTE_FORCE_LOGIN') RETURNING id
+                """,
+                (self.incident_id, self.target_value),
+            ).fetchone()["id"]
+        return self.l1_reports.submit_report(
+            L1ReportIn(
+                incident_id=self.incident_id,
+                verdict=verdict,
+                confidence="high",
+                severity=3,
+                summary="Repeated failed SSH logins followed by a successful one.",
+                indicators=[{"type": "ip", "value": self.target_value}],
+                evidence_alert_ids=[alert_id],
+                escalation_reason="Possible compromised account" if verdict == "true_positive" else None,
+                false_positive_reason="Scheduled vulnerability scan" if verdict == "false_positive" else None,
+            )
+        )
+
+    def test_approved_l1_report_escalates_true_positive(self):
+        from app.schemas import L1ReviewIn
+
+        report = self._l1_report()
+        self.assertEqual(report["status"], "pending_review")
+        self.assertEqual(self._incident_status(), "new")
+        self.assertIn(self.target_value, report["enrichment"])
+
+        result = self.l1_reports.approve_report(
+            report["id"], L1ReviewIn(severity=2), {"id": self.user_id, "role": "tier1"}
+        )
+
+        self.assertEqual(result["incident_status"], "investigating")
+        self.assertEqual(result["reviewer_changes"], ["severity"])
+        with self.test_pool.connection() as conn:
+            incident = conn.execute(
+                "SELECT severity, ai_summary, triaged_at FROM incidents WHERE id = %s", (self.incident_id,)
+            ).fetchone()
+        self.assertEqual(incident["severity"], 2)
+        self.assertEqual(incident["ai_summary"], report["summary"])
+        self.assertIsNotNone(incident["triaged_at"])
+
+    def test_approved_false_positive_l1_report_closes_incident(self):
+        from app.schemas import L1ReviewIn
+
+        report = self._l1_report("false_positive")
+        result = self.l1_reports.approve_report(
+            report["id"], L1ReviewIn(), {"id": self.user_id, "role": "tier1"}
+        )
+
+        self.assertEqual(result["incident_status"], "closed")
+        self.assertEqual(self._incident_status(), "closed")
+
+    def test_overriding_the_ai_verdict_needs_the_matching_reason(self):
+        from app.schemas import L1ReviewIn
+
+        report = self._l1_report()
+        user = {"id": self.user_id, "role": "tier1"}
+        with self.assertRaises(HTTPException) as error:
+            self.l1_reports.approve_report(report["id"], L1ReviewIn(verdict="false_positive"), user)
+        self.assertEqual(error.exception.status_code, 422)
+        self.assertEqual(self._incident_status(), "new")
+
+        result = self.l1_reports.approve_report(
+            report["id"],
+            L1ReviewIn(verdict="false_positive", false_positive_reason="Authorized penetration test"),
+            user,
+        )
+
+        self.assertEqual(result["incident_status"], "closed")
+        text = self.l1_reports.get_report_text(report["id"], user)
+        self.assertIn("L1 TRIAGE: CLOSED AS FALSE POSITIVE", text)
+        self.assertIn("The AI originally judged this a true positive.", text)
+
+    def test_only_one_l1_report_awaits_review_per_incident(self):
+        from app.schemas import L1RejectIn
+
+        first = self._l1_report()
+        with self.assertRaises(HTTPException) as error:
+            self._l1_report()
+        self.assertEqual(error.exception.status_code, 409)
+
+        self.l1_reports.reject_report(
+            first["id"], L1RejectIn(comment="Wrong host"), {"id": self.user_id, "role": "tier1"}
+        )
+        self.assertEqual(self._incident_status(), "new")
+        self.assertEqual(self._l1_report()["status"], "pending_review")
+
+    def test_l1_report_text_and_metrics(self):
+        report = self._l1_report()
+        user = {"id": self.user_id, "role": "tier1"}
+
+        text = self.l1_reports.get_report_text(report["id"], user)
+        metrics = self.l1_reports.report_metrics(user)
+
+        self.assertIn(f"INCIDENT #{self.incident_id} \u2014 L1 ESCALATION REPORT", text)
+        self.assertIn("Status: AI draft, awaiting L1 review", text)
+        self.assertIn("BRUTE_FORCE_LOGIN (source: ids)", text)
+        self.assertGreaterEqual(metrics["pending_review"], 1)
 
     def test_approved_action_moves_escalated_incident_to_in_response(self):
         recommendation_id = self._create_recommendation()

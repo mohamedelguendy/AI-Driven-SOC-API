@@ -1,31 +1,18 @@
 from ipaddress import ip_network
 from typing import Literal
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from psycopg.types.json import Jsonb
 
 from ..config import settings
 from ..db import pool
-from ..deps import get_current_user, require_roles
+from ..deps import get_current_user, require_ai_key, require_roles
 from ..evidence_validation import validate_evidence
 from ..schemas import DecisionIn, RecommendationIn
-from ..security import verify_api_key
 
 router = APIRouter(prefix="/recommendations", tags=["recommendations"])
 
 FINISHED_INCIDENT_STATUSES = ("resolved", "closed")
-
-
-
-
-# Authenticate the AI service independently of human users and alert feeders.
-def _check_ai_key(x_api_key: str | None = Header(default=None)):
-    """Separate machine credential for the AI SOC Engineer. Kept apart from
-    the SIEM ingest key and from user logins — three different callers,
-    three different credentials.
-    """
-    if not verify_api_key(x_api_key, settings.ai_api_key):
-        raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 
 
@@ -154,7 +141,7 @@ def _mark_in_response(conn, incident_id: int) -> None:
 
 
 # Store AI proposals as pending; execution always waits for human approval.
-@router.post("", dependencies=[Depends(_check_ai_key)])
+@router.post("", dependencies=[Depends(require_ai_key)])
 def create_recommendation(rec: RecommendationIn):
     """The AI submits a recommendation. It is stored as pending and
     NEVER executed here — a human always decides.
