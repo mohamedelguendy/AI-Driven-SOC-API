@@ -6,6 +6,9 @@ never be trusted to cite evidence that doesn't exist or doesn't apply.
 from typing import Any
 
 
+
+
+# Confirm every cited alert exists and belongs to the submitted incident.
 def validate_evidence(conn, incident_id: int, evidence_alert_ids: list[int]) -> dict[str, Any]:
     if not evidence_alert_ids:
         return {"valid": False, "errors": ["No evidence cited"], "validated_count": 0}

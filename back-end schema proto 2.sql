@@ -5,6 +5,7 @@
 -- =====================================================================
 
 -- ---------- Enumerated types ----------
+-- Define the allowed roles, event sources, workflow states, and audit actors.
 
 CREATE TYPE user_role AS ENUM ('tier1', 'tier2', 'tier3', 'admin');
 
@@ -35,6 +36,7 @@ CREATE TYPE executor_type AS ENUM ('firewall', 'edr');
 CREATE TYPE actor_type AS ENUM ('user', 'system', 'ai');
 
 -- ---------- Users ----------
+-- Store analyst accounts with role assignments and password hashes only.
 
 CREATE TABLE users (
     id             BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -46,6 +48,7 @@ CREATE TABLE users (
 );
 
 -- ---------- Incidents and alerts ----------
+-- Track incident lifecycle, risk ranking, and normalized plus raw alert data.
 
 CREATE TABLE incidents (
     id             BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -87,8 +90,7 @@ CREATE TABLE alerts (
                                                -- The backend normalizes to 1-5 when scoring.
     parse_status   parse_status NOT NULL DEFAULT 'ok',
     parse_notes    TEXT,                       -- e.g. 'src_ip "unknown" is not a valid IP'
-    raw_event      JSONB NOT NULL DEFAULT '{}' -- original event; if the payload is not JSON,
-                                               -- store it as {"_raw_text": "..."}
+    raw_event      JSONB NOT NULL DEFAULT '{}' -- the original event, exactly as received
 );
 
 CREATE INDEX idx_alerts_incident ON alerts (incident_id);
@@ -96,6 +98,7 @@ CREATE INDEX idx_alerts_src_ip   ON alerts (src_ip);
 CREATE INDEX idx_alerts_time     ON alerts ((COALESCE(event_time, ingested_at)) DESC);
 CREATE INDEX idx_alerts_parse    ON alerts (parse_status) WHERE parse_status <> 'ok';
 
+-- Keep analyst notes attached to both an incident and their author.
 CREATE TABLE incident_notes (
     id             BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     incident_id    BIGINT NOT NULL REFERENCES incidents(id),
@@ -108,6 +111,7 @@ CREATE TABLE incident_notes (
 -- A NULL column means "matches anything". The backend collects every rule
 -- that matches a recommendation and uses the HIGHEST impact level found.
 -- If no rule matches, the backend must treat the action as 'high' (fail safe).
+-- These rows are evaluated by the API before a human can approve a response.
 
 CREATE TABLE impact_rules (
     id             BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -129,6 +133,7 @@ INSERT INTO impact_rules (action_type, target_scope, is_internal, is_permanent, 
 
 -- ---------- Protected allowlist ----------
 -- Targets that can never be blocked or isolated by anyone, any tier.
+-- CIDR overlap checks protect both individual infrastructure IPs and larger ranges.
 
 CREATE TABLE protected_targets (
     id             BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -144,6 +149,7 @@ CREATE TABLE protected_targets (
 --     ('192.168.1.10/32', 'SOC platform server');
 
 -- ---------- AI recommendations ----------
+-- Save AI proposals separately from the human decision and eventual execution.
 
 CREATE TABLE recommendations (
     id              BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -168,6 +174,7 @@ CREATE TABLE recommendations (
 CREATE INDEX idx_recommendations_pending ON recommendations (status, impact);
 
 -- ---------- Executed actions ----------
+-- Record each attempted response, result, execution time, and reversal status.
 
 CREATE TABLE actions (
     id                BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -187,6 +194,7 @@ CREATE INDEX idx_actions_expiry ON actions (expires_at)
     WHERE reverted_at IS NULL AND expires_at IS NOT NULL;
 
 -- ---------- Audit log (append-only) ----------
+-- Preserve who or what changed the workflow, with immutable event details.
 
 CREATE TABLE audit_log (
     id             BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,

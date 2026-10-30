@@ -1,3 +1,5 @@
+-- Persist queued action execution and reversal work for retryable background processing.
+
 CREATE TABLE IF NOT EXISTS action_jobs (
     id              BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     action_id       BIGINT NOT NULL REFERENCES actions(id),
@@ -14,6 +16,7 @@ CREATE TABLE IF NOT EXISTS action_jobs (
     UNIQUE (action_id, operation)
 );
 
+-- Let workers find queued jobs and reclaim running jobs with expired leases.
 CREATE INDEX IF NOT EXISTS idx_action_jobs_ready
     ON action_jobs (next_attempt_at, id)
     WHERE status IN ('queued', 'running');

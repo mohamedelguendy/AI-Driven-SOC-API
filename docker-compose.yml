@@ -1,16 +1,16 @@
 services:
   db:
+    # PostgreSQL for local development; credentials come from the ignored .env file.
     image: postgres:16
     container_name: soc_db
     environment:
       POSTGRES_USER: soc
-      # Read from .env (Docker Compose loads it automatically). Never commit it.
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
       POSTGRES_DB: soc
     ports:
       - "127.0.0.1:5432:5432"  # reachable from this machine only
     volumes:
-      - soc_data:/var/lib/postgresql/data
+      - soc_data:/var/lib/postgresql/data  # keeps data across container restarts
 
 volumes:
   soc_data:

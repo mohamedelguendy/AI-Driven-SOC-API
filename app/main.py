@@ -8,6 +8,9 @@ from .db import pool
 from .routers import actions, alerts, analysis, auth, incidents, recommendations, threat_intel
 
 
+
+
+# Start background workers with the API and stop them cleanly during shutdown.
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     stop_event = threading.Event()
@@ -24,6 +27,9 @@ async def lifespan(app: FastAPI):
         pool.close()
 
 
+
+
+# Register all API routers and expose a database-backed readiness endpoint.
 app = FastAPI(title="AI-Driven SOC API", lifespan=lifespan)
 app.include_router(auth.router)
 app.include_router(alerts.router)
@@ -32,6 +38,8 @@ app.include_router(recommendations.router)
 app.include_router(actions.router)
 app.include_router(threat_intel.router)
 app.include_router(analysis.router)
+
+
 
 
 @app.get("/health")

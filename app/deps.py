@@ -8,6 +8,9 @@ from .security import decode_access_token
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
 
 
+
+
+# Decode the bearer token and re-check the account's current database status.
 def get_current_user(token: str = Depends(oauth2_scheme)) -> dict:
     error = HTTPException(
         status_code=401,
@@ -30,6 +33,9 @@ def get_current_user(token: str = Depends(oauth2_scheme)) -> dict:
     return user
 
 
+
+
+# Restrict a route to the listed roles after authenticating the caller.
 def require_roles(*roles: str):
     """Use as a dependency: Depends(require_roles('tier3', 'admin'))."""
 

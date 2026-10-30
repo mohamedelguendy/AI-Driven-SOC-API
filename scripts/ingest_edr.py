@@ -16,6 +16,9 @@ else:
 SEVERITY_MAP = {"LOW": 5, "MEDIUM": 3, "HIGH": 1}
 
 
+
+
+# Convert an EDR record into the backend's shared alert event shape.
 def normalize(alert: dict) -> dict:
     return {
         "source": "edr",
@@ -30,6 +33,9 @@ def normalize(alert: dict) -> dict:
     }
 
 
+
+
+# Validate CLI settings, tail the source file, and acknowledge delivered lines.
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", required=True, help="Path to edr_alerts.jsonl")
@@ -53,6 +59,8 @@ def main():
             continue
         send_alert(args.backend, args.api_key, normalize(alert), idempotency_key)
         acknowledge()
+
+
 
 
 if __name__ == "__main__":

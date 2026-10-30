@@ -1,6 +1,7 @@
 -- Adds IP reputation lookups (VirusTotal / AbuseIPDB), with caching so the
 -- same IP isn't re-queried on every alert.
- 
+
+-- Store provider status, verdict, response details, and lookup time per IP.
 CREATE TABLE IF NOT EXISTS threat_intel_lookups (
     id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     ip_address  INET NOT NULL,
@@ -10,5 +11,6 @@ CREATE TABLE IF NOT EXISTS threat_intel_lookups (
     details     JSONB NOT NULL DEFAULT '{}',
     queried_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
- 
+
+-- Support efficient retrieval of the most recent provider results per IP.
 CREATE INDEX IF NOT EXISTS idx_threat_intel_ip ON threat_intel_lookups (ip_address, queried_at DESC);

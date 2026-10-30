@@ -9,6 +9,9 @@ from ..intel_lookup import lookup_ip
 router = APIRouter(prefix="/threat-intel", tags=["threat-intel"])
 
 
+
+
+# Validate an IP and return provider results from cache or live lookups.
 @router.get("/{ip}")
 def get_lookup(ip: str, user: dict = Depends(get_current_user)):
     try:
@@ -20,6 +23,9 @@ def get_lookup(ip: str, user: dict = Depends(get_current_user)):
         return lookup_ip(conn, ip)
 
 
+
+
+# Return a bounded history of reputation checks.
 @router.get("")
 def list_lookups(limit: int = 50, user: dict = Depends(get_current_user)):
     limit = max(1, min(limit, 200))

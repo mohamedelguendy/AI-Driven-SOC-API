@@ -6,6 +6,9 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 FIREWALL_ACTION_TYPES = ("block_ip", "block_port")
 
 
+
+
+# Keep incoming security events flexible; route code validates extracted fields.
 class AlertIn(BaseModel):
     """What the security team's pipeline sends us.
 
@@ -25,10 +28,15 @@ class AlertIn(BaseModel):
     severity: Any = None
 
 
+
+
 class NoteIn(BaseModel):
     body: str = Field(min_length=1, max_length=10_000)
 
 
+
+
+# Validate proposed response actions and derive firewall targets server-side.
 class RecommendationIn(BaseModel):
     """What the AI SOC Engineer sends when it wants an action taken.
 
@@ -76,10 +84,15 @@ class RecommendationIn(BaseModel):
         return self
 
 
+
+
+# Shared request bodies for analyst decisions and incident triage.
 class DecisionIn(BaseModel):
     """Optional note when approving/rejecting a recommendation."""
 
     comment: str | None = Field(default=None, max_length=10_000)
+
+
 
 
 class TriageIn(BaseModel):

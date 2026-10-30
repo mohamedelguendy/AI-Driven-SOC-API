@@ -10,6 +10,9 @@ from ..schemas import NoteIn, TriageIn
 router = APIRouter(prefix="/incidents", tags=["incidents"])
 
 
+
+
+# Read the incident queue, prioritizing higher-risk cases.
 @router.get("")
 def list_incidents(
     status: Literal["new", "investigating", "escalated", "in_response", "resolved", "closed"] | None = None,
@@ -31,6 +34,9 @@ def list_incidents(
     return rows
 
 
+
+
+# Return one incident together with its alerts, notes, and proposals.
 @router.get("/{incident_id}")
 def get_incident(incident_id: int, user: dict = Depends(get_current_user)):
     with pool.connection() as conn:
@@ -65,6 +71,9 @@ def get_incident(incident_id: int, user: dict = Depends(get_current_user)):
     }
 
 
+
+
+# Record a one-time triage verdict and route or close the incident.
 @router.post("/{incident_id}/triage")
 def triage_incident(
     incident_id: int,
@@ -137,6 +146,9 @@ def triage_incident(
     }
 
 
+
+
+# Add an analyst note without silently changing incident state.
 @router.post("/{incident_id}/notes")
 def add_note(
     incident_id: int, note: NoteIn, user: dict = Depends(require_roles("tier1", "tier2", "tier3", "admin"))
@@ -167,6 +179,9 @@ def add_note(
     return row
 
 
+
+
+# Escalate a tier-2 investigation to tier 3.
 @router.post("/{incident_id}/escalate")
 def escalate(incident_id: int, user: dict = Depends(require_roles("tier2", "admin"))):
     """Tier 2 hands the incident to tier 3 for response."""
@@ -202,6 +217,9 @@ def escalate(incident_id: int, user: dict = Depends(require_roles("tier2", "admi
     return result
 
 
+
+
+# Resolve an active incident and preserve the decision in the audit trail.
 @router.post("/{incident_id}/resolve")
 def resolve(incident_id: int, user: dict = Depends(require_roles("tier2", "tier3", "admin"))):
     with pool.connection() as conn:

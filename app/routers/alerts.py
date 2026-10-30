@@ -23,6 +23,9 @@ CORRELATION_WINDOW_MINUTES = 30
 DEFAULT_INCIDENT_SEVERITY = 3
 
 
+
+
+# Authenticate alert feeders with their own API key.
 def _check_ingest_key(x_api_key: str | None = Header(default=None)):
     """Machine-to-machine auth for the security team's pipeline.
 
@@ -33,6 +36,9 @@ def _check_ingest_key(x_api_key: str | None = Header(default=None)):
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 
+
+
+# Parse common event fields independently so one bad value does not drop the alert.
 def _safe_ip(value: Any) -> tuple[str | None, str | None]:
     """Returns (valid_ip_or_None, note_if_invalid)."""
     if value is None or value == "":
@@ -42,6 +48,8 @@ def _safe_ip(value: Any) -> tuple[str | None, str | None]:
         return value, None
     except ValueError:
         return None, f'"{value}" is not a valid IP'
+
+
 
 
 def _safe_time(value: Any) -> tuple[datetime | None, str | None]:
@@ -58,6 +66,8 @@ def _safe_time(value: Any) -> tuple[datetime | None, str | None]:
         return None, f'"{value}" is not a valid ISO timestamp'
 
 
+
+
 def _safe_severity(value: Any) -> tuple[int | None, str | None]:
     if value is None:
         return None, None
@@ -70,12 +80,17 @@ def _safe_severity(value: Any) -> tuple[int | None, str | None]:
     return value, None
 
 
+
+
 def _safe_text(value: Any) -> str | None:
     if value is None or isinstance(value, str):
         return value
     return str(value)
 
 
+
+
+# Deduplicate an event, correlate it with an incident, and retain parse notes.
 @router.post("/ingest", dependencies=[Depends(_check_ingest_key)])
 def ingest_alert(
     alert: AlertIn,

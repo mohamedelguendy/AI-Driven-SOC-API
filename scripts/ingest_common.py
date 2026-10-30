@@ -13,6 +13,9 @@ REQUEST_TIMEOUT = 5
 MAX_RETRY_DELAY = 60
 
 
+
+
+# Create a stable checkpoint location and identify source files across rotation.
 def _default_state_path(source: str) -> Path:
     digest = hashlib.sha256(str(Path(source).resolve()).encode("utf-8")).hexdigest()
     state_dir = Path.home() / ".soc-ingest"
@@ -20,11 +23,16 @@ def _default_state_path(source: str) -> Path:
     return state_dir / f"{digest}.json"
 
 
+
+
 def _file_identity(path: Path) -> tuple[int, int]:
     stat = path.stat()
     return stat.st_dev, stat.st_ino
 
 
+
+
+# Save offsets atomically so a crash cannot leave a partial checkpoint file.
 def _write_checkpoint(state_path: Path, identity: tuple[int, int], offset: int) -> None:
     state_path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path = state_path.with_suffix(state_path.suffix + ".tmp")
@@ -35,6 +43,9 @@ def _write_checkpoint(state_path: Path, identity: tuple[int, int], offset: int) 
     os.replace(temporary_path, state_path)
 
 
+
+
+# Follow a growing log, handling restarts, replay, and rotated files.
 def follow_file(path: str, replay: bool, state_file: str | None = None):
     source_path = Path(path)
     state_path = Path(state_file) if state_file else _default_state_path(path)
@@ -103,6 +114,9 @@ def follow_file(path: str, replay: bool, state_file: str | None = None):
         file.close()
 
 
+
+
+# Parse one JSON object and report malformed source lines without crashing.
 def parse_json_line(line: str, source: str, line_number: int):
     try:
         value = json.loads(line)
@@ -118,6 +132,9 @@ def parse_json_line(line: str, source: str, line_number: int):
     return value
 
 
+
+
+# Deliver an event with a stable idempotency key and retry transient failures.
 def send_alert(
     backend_url: str,
     api_key: str,

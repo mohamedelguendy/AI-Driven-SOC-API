@@ -14,14 +14,19 @@ Run on the box where Suricata is writing eve.json:
 import argparse
 import os
 
-DEFAULT_SOURCE = "/var/log/suricata/eve.json"
 if __package__:
     from .ingest_common import follow_file, parse_json_line, send_alert
 else:
     from ingest_common import follow_file, parse_json_line, send_alert
+
+DEFAULT_SOURCE = "/var/log/suricata/eve.json"
+# Suricata severity 1-3 (1 = most severe) mapped onto the backend's 1-5 scale.
 SEVERITY_MAP = {1: 1, 2: 3, 3: 5}
 
 
+
+
+# Extract alert events from Suricata's eve.json record format.
 def normalize(event: dict) -> dict:
     """Map a Suricata eve.json alert event onto our AlertIn shape."""
     alert = event.get("alert") or {}
@@ -38,6 +43,9 @@ def normalize(event: dict) -> dict:
     }
 
 
+
+
+# Tail the log, skip non-alert events, and send normalized detections.
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", default=DEFAULT_SOURCE, help="Path to Suricata's eve.json")
@@ -66,6 +74,8 @@ def main():
 
         send_alert(args.backend, args.api_key, normalize(event), idempotency_key)
         acknowledge()
+
+
 
 
 if __name__ == "__main__":

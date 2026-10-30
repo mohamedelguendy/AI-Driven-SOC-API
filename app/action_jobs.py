@@ -13,6 +13,9 @@ CLAIM_TIMEOUT_SECONDS = 120
 LEASE_RENEW_INTERVAL_SECONDS = 30
 
 
+
+
+# Claim one ready job at a time; expired leases make abandoned work reclaimable.
 def _claim_job():
     """Atomically claim one ready job or reclaim one with an expired lease."""
     claim_token = uuid.uuid4()
@@ -45,6 +48,9 @@ def _claim_job():
         ).fetchone()
 
 
+
+
+# Refresh the claim timestamp while a provider call is still in progress.
 def _renew_lease(
     job: dict,
     stop_event: threading.Event,
@@ -68,6 +74,9 @@ def _renew_lease(
             print(f"[action-jobs] lease renewal failed for job {job['id']}: {error}")
 
 
+
+
+# Load the approved action and attach stable identifiers for adapter retries.
 def _job_command(job: dict) -> tuple[str, dict]:
     with pool.connection() as conn:
         action = conn.execute(
@@ -96,6 +105,9 @@ def _job_command(job: dict) -> tuple[str, dict]:
     return action["executor"], command
 
 
+
+
+# Persist the result and audit event only while this worker still owns the job.
 def _finish_job(job: dict, success: bool, message: str) -> None:
     retry = not success and job["attempts"] < MAX_ATTEMPTS
     delay_seconds = min(2 ** job["attempts"], 300)
@@ -189,6 +201,9 @@ def _finish_job(job: dict, success: bool, message: str) -> None:
         )
 
 
+
+
+# Keep a lease alive during slow adapter calls, then dispatch and record one job.
 def process_one_job() -> bool:
     job = _claim_job()
     if job is None:
@@ -221,6 +236,9 @@ def process_one_job() -> bool:
     return True
 
 
+
+
+# Poll continuously, but wait briefly when there is no ready work.
 def _loop(stop_event: threading.Event) -> None:
     while not stop_event.is_set():
         try:
@@ -232,6 +250,9 @@ def _loop(stop_event: threading.Event) -> None:
             stop_event.wait(CHECK_INTERVAL_SECONDS)
 
 
+
+
+# Start the worker as a managed daemon thread for the application lifespan.
 def start(stop_event: threading.Event) -> threading.Thread:
     thread = threading.Thread(target=_loop, args=(stop_event,), daemon=True)
     thread.start()

@@ -9,6 +9,9 @@ import re
 from typing import Any
 
 
+
+
+# Apply explainable signature and severity rules, then return an advisory result.
 def analyze_event(event: dict[str, Any]) -> dict[str, Any]:
     signature = (event.get("signature") or "").lower()
     severity_hint = event.get("severity")

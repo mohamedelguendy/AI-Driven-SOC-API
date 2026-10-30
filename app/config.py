@@ -5,6 +5,9 @@ from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+
+
+# Load environment-backed settings and reject unsafe or incomplete configuration.
 class Settings(BaseSettings):
     # extra="ignore": .env is shared with docker-compose (POSTGRES_PASSWORD)
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
@@ -23,8 +26,15 @@ class Settings(BaseSettings):
     abuseipdb_api_key: str | None = None
 
     # Firewall integration. "simulated" only logs what would happen;
-    # "meraki" pushes deny rules to Cisco Meraki MX networks.
-    firewall_mode: Literal["simulated", "meraki"] = "simulated"
+    # "fmc" blocks IPs on Cisco Secure Firewall through its management
+    # center; "meraki" pushes deny rules to Cisco Meraki MX networks.
+    firewall_mode: Literal["simulated", "fmc", "meraki"] = "simulated"
+    fmc_host: str = ""  # e.g. https://fmc.example.local
+    fmc_username: str = ""
+    fmc_password: str = ""
+    fmc_dynamic_object: str = "SOC-Blocked-IPs"
+    fmc_verify_tls: bool = True
+    fmc_ca_bundle: str = ""  # path to the FMC's CA certificate, if it's self-signed
     meraki_api_key: str | None = None
     meraki_network_ids: str = ""  # comma-separated, e.g. "L_123,N_456"
     meraki_base_url: str = "https://api.meraki.com/api/v1"
@@ -33,6 +43,20 @@ class Settings(BaseSettings):
     @property
     def meraki_network_id_list(self) -> list[str]:
         return [n.strip() for n in self.meraki_network_ids.split(",") if n.strip()]
+
+    @model_validator(mode="after")
+    def validate_fmc_settings(self):
+        if self.firewall_mode == "fmc":
+            missing = [
+                name.upper()
+                for name in ("fmc_host", "fmc_username", "fmc_password", "fmc_dynamic_object")
+                if not getattr(self, name).strip()
+            ]
+            if missing:
+                raise ValueError(f"{', '.join(missing)} required when FIREWALL_MODE=fmc")
+            if not self.fmc_host.startswith("https://"):
+                raise ValueError("FMC_HOST must start with https://")
+        return self
 
     @model_validator(mode="after")
     def validate_meraki_settings(self):
@@ -78,4 +102,7 @@ class Settings(BaseSettings):
         return ",".join(networks)
 
 
+
+
+# Share one validated configuration instance throughout the backend.
 settings = Settings()

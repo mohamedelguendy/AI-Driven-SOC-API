@@ -1,19 +1,22 @@
 """Auto-reverts temporary actions once their expires_at has passed.
- 
+
 Runs as a background thread (started in main.py's lifespan) so a
 temporary block doesn't require anyone to remember to undo it manually.
 Expired actions are queued once; the action worker retries failures and
 records jobs that exhaust their retry limit for operator follow-up.
 """
 import threading
- 
+
 from psycopg.types.json import Jsonb
 
 from .db import pool
- 
+
 CHECK_INTERVAL_SECONDS = 30
- 
- 
+
+
+
+
+# Queue one batch of expired successful actions without duplicating reversals.
 def _revert_expired_once():
     with pool.connection() as conn:
         expired = conn.execute(
@@ -44,8 +47,11 @@ def _revert_expired_once():
                 """,
                 (row["action_id"], Jsonb({"operation": "revert"})),
             )
- 
- 
+
+
+
+
+# Repeat expiry checks in the background without letting a failed cycle stop later ones.
 def _loop(stop_event: threading.Event):
     while not stop_event.is_set():
         try:
@@ -53,8 +59,11 @@ def _loop(stop_event: threading.Event):
         except Exception as e:  # noqa: BLE001 — one bad cycle must not kill the background thread
             print(f"[expiry] cycle failed: {e}")
         stop_event.wait(CHECK_INTERVAL_SECONDS)
- 
- 
+
+
+
+
+# Start expiry checks as a managed daemon thread.
 def start(stop_event: threading.Event) -> threading.Thread:
     thread = threading.Thread(target=_loop, args=(stop_event,), daemon=True)
     thread.start()

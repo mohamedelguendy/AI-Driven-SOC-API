@@ -1,32 +1,23 @@
-"""Firewall adapter.
- 
-SIMULATED until the security team shares how the firewall is controlled
-(its API, or SSH access). When that's available, replace the bodies of
-execute() and revert() with the real calls — everything upstream
-(approval, impact rules, allowlist, expiry, audit log) stays the same.
+"""Simulated firewall adapter, used when FIREWALL_MODE=simulated.
+
+Reports what would be done without contacting any device, so the whole
+approval -> execution -> expiry -> revert workflow can be demonstrated
+safely. Real enforcement lives in secure_firewall.py (FIREWALL_MODE=fmc)
+and meraki.py (FIREWALL_MODE=meraki).
 """
- 
- 
+
+
+
+
+# Report the requested change without touching a real firewall.
 def execute(command: dict) -> tuple[bool, str]:
-    """Apply a block/allow rule. Returns (success, message)."""
-    action = command["action_type"]
-    target = command["target"]
- 
-    # --- real integration goes here, e.g. ---
-    # try:
-    #     response = requests.post(FIREWALL_API_URL, json={...}, timeout=5)
-    #     return response.ok, response.text
-    # except requests.RequestException as e:
-    #     return False, f"Firewall unreachable: {e}"
- 
-    return True, f"[SIMULATED] firewall: {action} on {target}"
- 
- 
+    """Pretend to apply a block. Returns (success, message)."""
+    return True, f"[SIMULATED] firewall: {command['action_type']} on {command['target']}"
+
+
+
+
+# Report the reversal without touching a real firewall.
 def revert(command: dict) -> tuple[bool, str]:
-    """Undo a previously applied rule (e.g. unblock an IP)."""
-    target = command["target"]
- 
-    # --- real integration goes here ---
- 
-    return True, f"[SIMULATED] firewall: removed block on {target}"
- 
+    """Pretend to remove a block (e.g. unblock an IP)."""
+    return True, f"[SIMULATED] firewall: removed block on {command['target']}"

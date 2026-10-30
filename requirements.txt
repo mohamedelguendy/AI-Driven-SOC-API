@@ -1,31 +1,42 @@
-annotated-doc==0.0.5
-annotated-types==0.8.0
-anyio==4.15.1
-argon2-cffi==25.1.0
-argon2-cffi-bindings==26.1.0
-cffi==2.1.1
-click==8.5.0
+# FastAPI server and ASGI runtime.
 fastapi==0.141.1
-h11==0.16.0
-httptools==0.8.0
-idna==3.20
+uvicorn==0.53.0
+starlette==1.6.0
+
+# PostgreSQL driver and connection pool.
 psycopg==3.3.6
 psycopg-binary==3.3.6
 psycopg-pool==3.3.2
-pwdlib==0.3.1
-pycparser==3.0
+
+# Request models, settings, password hashing, and JWT authentication.
 pydantic==2.13.5
 pydantic-settings==2.15.0
-pydantic_core==2.46.5
 PyJWT==2.14.0
+pwdlib==0.3.1
+argon2-cffi==25.1.0
+argon2-cffi-bindings==26.1.0
+
+# Outbound HTTP requests to enrichment and firewall providers.
 requests==2.32.3
-python-dotenv==1.2.3
+
+# Multipart form parsing used by the login endpoint.
 python-multipart==0.0.32
+
+# Supporting packages retained at their pinned versions for reproducible installs.
+annotated-doc==0.0.5
+annotated-types==0.8.0
+anyio==4.15.1
+cffi==2.1.1
+click==8.5.0
+h11==0.16.0
+httptools==0.8.0
+idna==3.20
+pycparser==3.0
+pydantic_core==2.46.5
+python-dotenv==1.2.3
 PyYAML==6.0.3
-starlette==1.6.0
 typing-inspection==0.4.4
 typing_extensions==4.16.0
 tzdata==2026.4
-uvicorn==0.53.0
 watchfiles==1.2.0
 websockets==17.1

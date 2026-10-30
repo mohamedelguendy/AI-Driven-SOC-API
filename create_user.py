@@ -14,6 +14,9 @@ from app.security import hash_password
 ROLES = ("tier1", "tier2", "tier3", "admin")
 
 
+
+
+# Prompt for an analyst account and store only its Argon2 password hash.
 def main() -> None:
     username = input("Username: ").strip()
     role = input(f"Role {ROLES}: ").strip()
@@ -36,6 +39,8 @@ def main() -> None:
         pool.close()
 
     print(f"Created {role} user '{username}'")
+
+
 
 
 if __name__ == "__main__":

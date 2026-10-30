@@ -36,6 +36,9 @@ else:
 SEVERITY_MAP = {"LOW": 5, "MEDIUM": 3, "HIGH": 1}
 
 
+
+
+# Map a custom IDS-engine record into the shared backend alert format.
 def normalize(alert: dict) -> dict:
     return {
         "source": "ids",
@@ -50,6 +53,9 @@ def normalize(alert: dict) -> dict:
     }
 
 
+
+
+# Tail the IDS output and forward each parsed event to the API.
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", required=True, help="Path to ids_alerts.jsonl")
@@ -71,12 +77,10 @@ def main():
         if alert is None:
             acknowledge()
             continue
-        if not isinstance(alert, dict):
-            print(f"[error] {args.source}:{line_number}: expected a JSON object")
-            acknowledge()
-            continue
         send_alert(args.backend, args.api_key, normalize(alert), idempotency_key)
         acknowledge()
+
+
 
 
 if __name__ == "__main__":

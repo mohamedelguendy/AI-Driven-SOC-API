@@ -10,48 +10,50 @@ response execution via firewall/EDR adapters.
 - **Python / FastAPI** — the API
 - **PostgreSQL** (Docker) — the database
 - **JWT + Argon2** — auth
-- **requests** — threat intel lookups (AbuseIPDB / VirusTotal)
+- **requests** — threat intel lookups (AbuseIPDB / VirusTotal) and firewall APIs
 
 ## Project structure
 
 ```
 back-end/
   app/
-    main.py                 # entry point, wires routers together, starts background workers
-    config.py                # loads .env
+    main.py                   # entry point: routers + background workers
+    config.py                 # loads and validates .env
     db.py                     # PostgreSQL connection pool
-    security.py              # password hashing + JWT
-    deps.py                    # auth dependency + role checks
-    schemas.py               # request/response models
-    alert_classifier.py     # rule-based alert classifier (suggestion only)
-    evidence_validation.py   # confirms an AI report's cited evidence is real
-    intel_lookup.py          # IP reputation lookups (AbuseIPDB / VirusTotal), cached
+    security.py               # password hashing + JWT
+    deps.py                   # auth dependency + role checks
+    schemas.py                # request/response models
+    alert_classifier.py       # rule-based alert classifier (suggestion only)
+    evidence_validation.py    # confirms an AI report's cited evidence is real
+    intel_lookup.py           # IP reputation lookups (AbuseIPDB / VirusTotal), cached
     expiry.py                 # queues reverts for expired temporary actions
     action_jobs.py            # durable, retryable execution/revert worker
     adapters/
-      firewall.py             # simulated firewall execute()/revert()
-      meraki.py               # Cisco Meraki MX firewall execute()/revert()
-      edr.py                  # simulated EDR execute()/revert()
+      firewall.py             # simulated firewall (FIREWALL_MODE=simulated)
+      secure_firewall.py      # Cisco Secure Firewall via FMC (FIREWALL_MODE=fmc)
+      meraki.py               # Cisco Meraki MX (FIREWALL_MODE=meraki)
+      edr.py                  # simulated EDR
     routers/
-      auth.py                  # POST /auth/login, GET /auth/me
-      alerts.py                # POST /alerts/ingest
-      incidents.py             # incident queue, tier1 triage, notes, escalate, resolve
+      auth.py                 # POST /auth/login, GET /auth/me
+      alerts.py               # POST /alerts/ingest
+      incidents.py            # incident queue, tier1 triage, notes, escalate, resolve
       recommendations.py      # AI recommendations + approve/reject (tier2/tier3 impact rule)
-      actions.py                # list actions, manual revert
-      analysis.py               # POST /analysis/classify, /analysis/validate-evidence
-      threat_intel.py          # GET /threat-intel/{ip}, GET /threat-intel
+      actions.py              # list actions, manual revert
+      analysis.py             # POST /analysis/classify, /analysis/validate-evidence
+      threat_intel.py         # GET /threat-intel/{ip}, GET /threat-intel
   scripts/
     ingest_common.py          # shared checkpointing and retry-safe alert delivery
     ingest_suricata.py        # feeds Suricata eve.json alerts into /alerts/ingest
     ingest_zeek.py            # feeds Zeek conn.log (filtered) into /alerts/ingest
     ingest_edr.py             # feeds EDR agent alerts into /alerts/ingest
     ingest_ids_engine.py      # feeds brute-force/port-scan alerts into /alerts/ingest
+  tests/                      # unit tests + PostgreSQL workflow tests
+  migration/                  # incremental DB changes (run after the base schema)
   back-end schema proto 2.sql # full database schema
-  migration/                   # incremental DB changes (run after the base schema)
   docker-compose.yml          # runs PostgreSQL locally
-  create_user.py               # CLI to create an analyst account
-  run.py                        # starts the server AND opens /docs automatically
-  .env.example                  # template for your own .env (never commit .env)
+  create_user.py              # CLI to create an analyst account
+  run.py                      # starts the server AND opens /docs automatically
+  .env.example                # template for your own .env (never commit .env)
 ```
 
 ## Setup (first time on a new machine)
@@ -96,7 +98,7 @@ back-end/
    ```bash
    python run.py
    ```
-   Opens `http://localhost:8000/docs` automatically.
+   Opens `http://127.0.0.1:8000/docs` automatically.
 
 ## Tests
 
@@ -163,6 +165,36 @@ them with the comma-separated `INTERNAL_NETWORK_CIDRS` setting.
 Suricata's own events — that double-ingests Suricata alerts. See the
 docstring in `ingest_ids_engine.py`.
 
+## Cisco Secure Firewall
+
+Set `FIREWALL_MODE=fmc` to block IPs on Cisco Secure Firewall (FTD) through
+its Firewall Management Center (FMC 7.0 or later). The backend adds and
+removes IPs in an FMC **dynamic object**. Dynamic object changes reach the
+firewalls without a policy deployment, so the SOC never deploys policy and
+never pushes anyone else's pending changes.
+
+One-time setup on the FMC:
+
+1. Create a dedicated API user for the SOC with permission to edit objects.
+2. Create a dynamic object of type IP named `SOC-Blocked-IPs` (or whatever
+   you set in `FMC_DYNAMIC_OBJECT`). Use it only for the SOC: a revert
+   removes the IP even if someone also added it by hand.
+3. At the top of the access control policy, add two Block rules: one with
+   the dynamic object as the source (traffic from the attacker), one with it
+   as the destination (traffic to the attacker). Deploy once.
+
+| Setting | Purpose |
+|---|---|
+| `FMC_HOST` | FMC address, e.g. `https://fmc.example.local` |
+| `FMC_USERNAME` / `FMC_PASSWORD` | The SOC's API user |
+| `FMC_DYNAMIC_OBJECT` | Name of the dynamic object (default `SOC-Blocked-IPs`) |
+| `FMC_VERIFY_TLS` | Leave `true`; for a self-signed FMC certificate set `FMC_CA_BUNDLE` to its CA file instead of disabling checks |
+
+Only `block_ip` is supported (single IPs and CIDR ranges); other firewall
+action types are rejected with 422 while `FIREWALL_MODE=fmc`. For a free
+FMC to test against, use an FMCv evaluation license or a Cisco DevNet
+Secure Firewall sandbox.
+
 ## Cisco Meraki firewall
 
 Set `FIREWALL_MODE=meraki` to send approved firewall actions to Meraki MX
@@ -196,7 +228,7 @@ moment can still be overwritten. Try it on a test network first.
 
 EDR execution is currently simulated (logged, not sent to a real device)
 — pending access details from the security team. Firewall execution is
-simulated unless `FIREWALL_MODE=meraki`. Approvals and
+simulated unless `FIREWALL_MODE` is `fmc` or `meraki`. Approvals and
 reversions are durable queued jobs; the worker retries failures up to eight
 times with exponential backoff and renews its database lease while an adapter
 call is active. A failed reversal can be retried by calling the same revert

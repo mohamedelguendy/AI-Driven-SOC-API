@@ -8,6 +8,9 @@ from ..schemas import DecisionIn
 router = APIRouter(prefix="/actions", tags=["actions"])
 
 
+
+
+# List action history, optionally narrowed to actions still in effect.
 @router.get("")
 def list_actions(active_only: bool = False, user: dict = Depends(get_current_user)):
     """active_only=true shows only actions still in effect (not reverted,
@@ -25,6 +28,9 @@ def list_actions(active_only: bool = False, user: dict = Depends(get_current_use
     return rows
 
 
+
+
+# Queue or retry a manual reversal and record who requested it.
 @router.post("/{action_id}/revert")
 def revert_action(
     action_id: int,

@@ -20,6 +20,9 @@ MANUAL_RULE = {
 }
 
 
+
+
+# Represent HTTP status, headers, and JSON without calling a real Dashboard API.
 class FakeResponse:
     def __init__(self, status_code, payload=None, headers=None):
         self.status_code = status_code
@@ -31,6 +34,8 @@ class FakeResponse:
 
     def json(self):
         return self._payload
+
+
 
 
 class FakeDashboard:
@@ -66,7 +71,11 @@ class FakeDashboard:
         return FakeResponse(200, json)
 
 
+
+
 class FakePool:
+    """Stub the advisory-lock database connection used by the adapter."""
+
     @contextmanager
     def connection(self):
         class Connection:
@@ -76,6 +85,9 @@ class FakePool:
         yield Connection()
 
 
+
+
+# Cover Meraki rule creation, retries, duplicate prevention, and reversals.
 class MerakiAdapterTests(unittest.TestCase):
     command = {"action_id": 7, "action_type": "block_ip", "target": "203.0.113.7", "executor": "firewall"}
 
@@ -174,6 +186,9 @@ class MerakiAdapterTests(unittest.TestCase):
             self.assertIs(adapters._adapter_for("firewall"), meraki)
 
 
+
+
+# Ensure backend-derived firewall target scopes override untrusted AI values.
 class RecommendationTargetTests(unittest.TestCase):
     base = {
         "incident_id": 1,
@@ -212,6 +227,8 @@ class RecommendationTargetTests(unittest.TestCase):
             **{**self.base, "executor": "edr"}, action_type="isolate_host", target_value="ws-01"
         )
         self.assertEqual(recommendation.target_value, "ws-01")
+
+
 
 
 if __name__ == "__main__":

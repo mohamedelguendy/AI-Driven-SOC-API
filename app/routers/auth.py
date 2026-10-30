@@ -2,9 +2,8 @@ import hashlib
 import secrets
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.security import OAuth2PasswordRequestForm
-from fastapi import Request
 from psycopg.types.json import Jsonb
 
 from ..db import pool
@@ -21,6 +20,9 @@ LOGIN_WINDOW = timedelta(minutes=15)
 _TIMING_DUMMY_HASH = hash_password(secrets.token_urlsafe(32))
 
 
+
+
+# Build privacy-preserving keys for the IP and username login limits.
 def _login_bucket_keys(username: str, client_ip: str) -> tuple[str, str]:
     normalized_username = username.strip().casefold()
     return (
@@ -29,6 +31,9 @@ def _login_bucket_keys(username: str, client_ip: str) -> tuple[str, str]:
     )
 
 
+
+
+# Update both rate-limit windows and return any active retry delay.
 def _record_login_attempt(conn, username: str, client_ip: str) -> int | None:
     retry_after = 0
     now = datetime.now(timezone.utc)
@@ -67,6 +72,10 @@ def _record_login_attempt(conn, username: str, client_ip: str) -> int | None:
     )
     return retry_after or None
 
+
+
+
+# Authenticate, enforce rate limits, audit the result, and issue a token.
 @router.post("/login")
 def login(request: Request, form: OAuth2PasswordRequestForm = Depends()):  # noqa: B008
     with pool.connection() as conn:
@@ -131,6 +140,9 @@ def login(request: Request, form: OAuth2PasswordRequestForm = Depends()):  # noq
     }
 
 
+
+
+# Return the authenticated user's current identity and role.
 @router.get("/me")
 def me(user: dict = Depends(get_current_user)):  # noqa: B008
     return {"id": user["id"], "username": user["username"], "role": user["role"]}

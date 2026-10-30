@@ -12,6 +12,7 @@ Run on the box where Zeek is writing its logs:
 """
 import argparse
 import os
+from datetime import datetime, timezone
 
 if __package__:
     from .ingest_common import follow_file, parse_json_line, send_alert
@@ -24,10 +25,16 @@ else:
 INTERESTING_STATES = {"S0", "REJ", "RSTO", "RSTR"}  # failed/rejected/reset connections
 
 
+
+
+# Keep only connection outcomes selected for analyst review.
 def is_interesting(record: dict) -> bool:
     return record.get("conn_state") in INTERESTING_STATES
 
 
+
+
+# Convert Zeek connection fields and timestamps into a backend alert.
 def normalize(record: dict) -> dict:
     return {
         "source": "ids",
@@ -43,18 +50,23 @@ def normalize(record: dict) -> dict:
     }
 
 
+
+
+# Convert Zeek epoch timestamps to ISO format, retaining invalid input for ingestion notes.
 def _ts_to_iso(ts):
     """Zeek timestamps are unix epoch floats; keep as-is if conversion fails
     (ingestion is tolerant of a non-ISO event_time — it just logs a note)."""
     if ts is None:
         return None
     try:
-        from datetime import datetime, timezone
         return datetime.fromtimestamp(float(ts), tz=timezone.utc).isoformat()
     except (ValueError, TypeError, OSError):
         return str(ts)
 
 
+
+
+# Tail Zeek JSON logs and forward only selected connection records.
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", required=True, help="Path to Zeek's conn.log (JSON format)")
@@ -84,6 +96,8 @@ def main():
 
         send_alert(args.backend, args.api_key, normalize(record), idempotency_key)
         acknowledge()
+
+
 
 
 if __name__ == "__main__":

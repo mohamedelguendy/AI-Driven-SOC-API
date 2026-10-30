@@ -16,6 +16,9 @@ CACHE_TTL = timedelta(hours=1)
 REQUEST_TIMEOUT = 5  # seconds — never let a slow provider stall a request
 
 
+
+
+# Query one external reputation provider and normalize its response.
 def _query_virustotal(ip: str) -> dict:
     try:
         resp = requests.get(
@@ -32,6 +35,9 @@ def _query_virustotal(ip: str) -> dict:
         return {"status": "error", "verdict": "unknown", "details": {"error": str(e)}}
 
 
+
+
+# Query AbuseIPDB and translate its confidence score into a basic verdict.
 def _query_abuseipdb(ip: str) -> dict:
     try:
         resp = requests.get(
@@ -49,6 +55,9 @@ def _query_abuseipdb(ip: str) -> dict:
         return {"status": "error", "verdict": "unknown", "details": {"error": str(e)}}
 
 
+
+
+# Reuse recent provider results, call configured providers, and store outcomes.
 def lookup_ip(conn, ip_address: str) -> dict:
     cached_rows = conn.execute(
         """
@@ -61,6 +70,7 @@ def lookup_ip(conn, ip_address: str) -> dict:
         """,
         (ip_address, CACHE_TTL),
     ).fetchall()
+
     cached_by_provider = {}
     for row in cached_rows:
         cached_by_provider.setdefault(row["provider"], row)
@@ -73,6 +83,7 @@ def lookup_ip(conn, ip_address: str) -> dict:
     ):
         cached = cached_by_provider.get(provider)
         use_cached = cached and (cached["status"] != "no_provider_configured" or not key)
+
         if use_cached:
             result = {
                 "provider": provider,
@@ -95,6 +106,7 @@ def lookup_ip(conn, ip_address: str) -> dict:
                 """,
                 (ip_address, result["provider"], result["status"], result["verdict"], Jsonb(result["details"])),
             )
+
         results.append(result)
 
     return {"ip_address": ip_address, "results": results, "cached": all_cached}

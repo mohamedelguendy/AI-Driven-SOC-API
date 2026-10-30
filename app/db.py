@@ -3,7 +3,10 @@ from psycopg_pool import ConnectionPool
 
 from .config import settings
 
-# Rows come back as dicts, e.g. user["role"]
+
+
+
+# Rows come back as dicts so code can address columns by name, e.g. user["role"].
 pool = ConnectionPool(
     settings.database_url,
     kwargs={"row_factory": dict_row},

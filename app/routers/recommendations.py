@@ -15,6 +15,9 @@ router = APIRouter(prefix="/recommendations", tags=["recommendations"])
 FINISHED_INCIDENT_STATUSES = ("resolved", "closed")
 
 
+
+
+# Authenticate the AI service independently of human users and alert feeders.
 def _check_ai_key(x_api_key: str | None = Header(default=None)):
     """Separate machine credential for the AI SOC Engineer. Kept apart from
     the SIEM ingest key and from user logins — three different callers,
@@ -24,6 +27,9 @@ def _check_ai_key(x_api_key: str | None = Header(default=None)):
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 
+
+
+# Determine whether an IP or network overlaps configured internal ranges.
 def _looks_internal(target_value: str) -> bool:
     """Return whether an IP target overlaps a configured internal network."""
     try:
@@ -38,6 +44,9 @@ def _looks_internal(target_value: str) -> bool:
     return False
 
 
+
+
+# Combine matching policy rules using the most restrictive impact.
 def determine_impact(conn, action_type: str, target_scope: str, is_internal: bool, is_permanent: bool) -> str:
     """The backend assigns impact — never trusts the AI's own labeling.
     Every matching rule is considered; the highest impact found wins.
@@ -59,6 +68,9 @@ def determine_impact(conn, action_type: str, target_scope: str, is_internal: boo
     return "high" if any(r["impact"] == "high" for r in rules) else "low"
 
 
+
+
+# Block a proposed action if its target overlaps a protected network.
 def _is_protected(conn, target_value: str) -> bool:
     """True if an IP target overlaps a protected network.
 
@@ -78,6 +90,9 @@ def _is_protected(conn, target_value: str) -> bool:
     return row is not None
 
 
+
+
+# Find equivalent successful actions and prevent duplicate response work.
 def _find_active_action(conn, target_value: str, action_type: str, executor: str):
     """An 'active' action: it succeeded, hasn't been reverted, and hasn't
     expired. Used to avoid double-blocking the same target — approving a
@@ -99,6 +114,9 @@ def _find_active_action(conn, target_value: str, action_type: str, executor: str
     ).fetchone()
 
 
+
+
+# Find matching executions that are still queued or running.
 def _find_pending_action(conn, target_value: str, action_type: str, executor: str):
     """Find an execution for this target that is queued or currently running."""
     return conn.execute(
@@ -117,6 +135,9 @@ def _find_pending_action(conn, target_value: str, action_type: str, executor: st
     ).fetchone()
 
 
+
+
+# Mark escalated incidents as actively receiving a response.
 def _mark_in_response(conn, incident_id: int) -> None:
     """An approved action on an escalated incident means tier 3 is now
     responding to it."""
@@ -129,11 +150,20 @@ def _mark_in_response(conn, incident_id: int) -> None:
     )
 
 
+
+
+# Store AI proposals as pending; execution always waits for human approval.
 @router.post("", dependencies=[Depends(_check_ai_key)])
 def create_recommendation(rec: RecommendationIn):
     """The AI submits a recommendation. It is stored as pending and
     NEVER executed here — a human always decides.
     """
+    if rec.executor == "firewall" and settings.firewall_mode == "fmc" and rec.action_type != "block_ip":
+        raise HTTPException(
+            status_code=422,
+            detail="The Secure Firewall integration supports block_ip only",
+        )
+
     is_internal = _looks_internal(rec.target_value)
 
     with pool.connection() as conn:
@@ -202,6 +232,9 @@ def create_recommendation(rec: RecommendationIn):
     return row
 
 
+
+
+# Let authenticated analysts filter and review submitted proposals.
 @router.get("")
 def list_recommendations(
     status: Literal["pending", "approved", "rejected", "executed", "failed", "expired"] | None = None,
@@ -219,6 +252,9 @@ def list_recommendations(
     return rows
 
 
+
+
+# Recheck permissions and safety rules, then queue approved work durably.
 @router.post("/{rec_id}/approve")
 def approve(
     rec_id: int,
@@ -352,6 +388,9 @@ def approve(
     }
 
 
+
+
+# Record rejection without creating an action job.
 @router.post("/{rec_id}/reject")
 def reject(
     rec_id: int,

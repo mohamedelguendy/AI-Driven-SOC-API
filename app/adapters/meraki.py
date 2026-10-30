@@ -26,10 +26,15 @@ OUTBOUND = "l3FirewallRules"
 INBOUND = "inboundFirewallRules"
 
 
+
+
 class MerakiError(Exception):
     pass
 
 
+
+
+# Send Dashboard API requests with bounded rate-limit retries and timeouts.
 def _request(method: str, path: str, body: dict | None = None) -> dict:
     url = settings.meraki_base_url.rstrip("/") + path
     headers = {
@@ -56,18 +61,28 @@ def _request(method: str, path: str, body: dict | None = None) -> dict:
         return response.json() if response.content else {}
 
 
+
+
+# Build a stable tag used to find this action's rules during retries and reverts.
 def _tag(command: dict) -> str:
     return f"[soc-action-{command['action_id']}]"
+
+
 
 
 def _has_tag(rule: dict, tag: str) -> bool:
     return tag in (rule.get("comment") or "")
 
 
+
+
 def _rulesets() -> list[str]:
     return [OUTBOUND, INBOUND] if settings.meraki_block_inbound else [OUTBOUND]
 
 
+
+
+# Assemble provider-format deny-rule entries for supported block actions.
 def _deny_rule(comment: str, protocol: str, src_cidr: str, dest_cidr: str, dest_port: str) -> dict:
     return {
         "comment": comment,
@@ -78,6 +93,8 @@ def _deny_rule(comment: str, protocol: str, src_cidr: str, dest_cidr: str, dest_
         "destCidr": dest_cidr,
         "destPort": dest_port,
     }
+
+
 
 
 def _deny_rules(command: dict, ruleset: str) -> list[dict]:
@@ -98,6 +115,9 @@ def _deny_rules(command: dict, ruleset: str) -> list[dict]:
     raise MerakiError(f"Meraki adapter does not support action type '{action_type}'")
 
 
+
+
+# Serialize read-modify-write updates so workers cannot overwrite each other.
 def _update_rules(network_id: str, ruleset: str, change) -> None:
     """Apply change(rules) -> new rules (or None for "nothing to do")."""
     path = f"/networks/{network_id}/appliance/firewall/{ruleset}"
@@ -121,6 +141,9 @@ def _update_rules(network_id: str, ruleset: str, change) -> None:
         _request("PUT", path, body)
 
 
+
+
+# Remove only rules carrying this action's tag from the current configured scope.
 def _remove_tagged(tag: str) -> str | None:
     """Remove this action's rules everywhere. Returns an error message, or None."""
 
@@ -137,6 +160,9 @@ def _remove_tagged(tag: str) -> str | None:
     return None
 
 
+
+
+# Apply the block across configured networks and clean up partial failures.
 def execute(command: dict) -> tuple[bool, str]:
     """Add the deny rules on every configured network. Returns (success, message)."""
     tag = _tag(command)
@@ -171,6 +197,9 @@ def execute(command: dict) -> tuple[bool, str]:
     )
 
 
+
+
+# Reverse an action by removing its tagged rules.
 def revert(command: dict) -> tuple[bool, str]:
     """Remove the rules this action added (unblock)."""
     error = _remove_tagged(_tag(command))

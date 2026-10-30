@@ -25,9 +25,14 @@ from scripts import ingest_edr, ingest_ids_engine, ingest_suricata, ingest_zeek
 from scripts.ingest_common import follow_file, send_alert
 
 
+
+
 TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL")
 
 
+
+
+# Check request validation and configuration rules without requiring PostgreSQL.
 class InputValidationTests(unittest.TestCase):
     def test_application_secrets_must_be_strong_and_non_placeholder(self):
         required = {
@@ -98,6 +103,9 @@ class InputValidationTests(unittest.TestCase):
         self.assertEqual(zeek_severity, 3)
 
 
+
+
+# Exercise feeder checkpoints, retry behavior, classifier output, and target scope.
 class IngestHelperTests(unittest.TestCase):
     def test_checkpoint_restart_replays_unacknowledged_line_with_same_key(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -174,6 +182,9 @@ class IngestHelperTests(unittest.TestCase):
         self.assertFalse(_looks_internal("security-host.example"))
 
 
+
+
+# Verify threat-intel cache behavior and provider error handling.
 class ThreatIntelCacheTests(unittest.TestCase):
     def test_cached_lookup_returns_the_same_provider_list_shape(self):
         from app import intel_lookup
@@ -258,8 +269,17 @@ class ThreatIntelCacheTests(unittest.TestCase):
         self.assertEqual(len(connection.inserted), 1)
 
 
+
+
 @unittest.skipUnless(TEST_DATABASE_URL, "Set TEST_DATABASE_URL to run PostgreSQL concurrency tests")
+
+
+
+
+# Run database-backed workflows against an isolated schema to test races and recovery.
 class WorkflowConcurrencyTests(unittest.TestCase):
+    """Exercise database-backed behavior with an isolated schema per test run."""
+
     @classmethod
     def setUpClass(cls):
         cls.schema = f"soc_test_{uuid.uuid4().hex}"
@@ -330,6 +350,7 @@ class WorkflowConcurrencyTests(unittest.TestCase):
         with psycopg.connect(TEST_DATABASE_URL) as conn:
             conn.execute(sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(cls.schema)))
 
+    # Create independent test data so concurrency cases cannot affect one another.
     def setUp(self):
         self.target_value = f"203.0.113.{uuid.uuid4().int % 254 + 1}"
         with self.test_pool.connection() as conn:
@@ -344,6 +365,7 @@ class WorkflowConcurrencyTests(unittest.TestCase):
             self.user_id = user["id"]
             self.incident_id = incident["id"]
 
+    # Insert a pending firewall proposal for the current test incident.
     def _create_recommendation(self, target_value=None):
         target_value = target_value or self.target_value
         with self.test_pool.connection() as conn:
@@ -360,6 +382,7 @@ class WorkflowConcurrencyTests(unittest.TestCase):
             ).fetchone()
         return row["id"]
 
+    # Verify allowlist overlap checks reject both contained and containing ranges.
     def test_protected_target_blocks_overlapping_subnets(self):
         with self.test_pool.connection() as conn:
             conn.execute(
@@ -374,6 +397,7 @@ class WorkflowConcurrencyTests(unittest.TestCase):
         self.assertTrue(containing_allowlist)
         self.assertFalse(unrelated)
 
+    # Coordinate concurrent requests so the database race is reproducible.
     def _sync_recommendation_read(self):
         original_pool = self.test_pool
         barrier = threading.Barrier(2)
@@ -460,6 +484,7 @@ class WorkflowConcurrencyTests(unittest.TestCase):
 
         return SynchronizedPool()
 
+    # Incident-state concurrency and alert-ingestion durability cases.
     def test_concurrent_triage_records_only_one_verdict(self):
         from app.schemas import TriageIn
 
@@ -602,6 +627,7 @@ class WorkflowConcurrencyTests(unittest.TestCase):
 
         self.assertEqual(results[0]["incident_id"], results[1]["incident_id"])
 
+    # Recommendation decisions must be atomic, permission-safe, and idempotent.
     def test_concurrent_approve_and_reject_make_one_decision(self):
         recommendation_id = self._create_recommendation()
         self.recommendations.pool = self._sync_recommendation_read()
@@ -810,6 +836,7 @@ class WorkflowConcurrencyTests(unittest.TestCase):
         ):
             self.assertTrue(self.action_jobs.process_one_job())
 
+    # Worker retry, lease ownership, and expiry tests cover action recovery.
     def test_failed_revert_can_be_retried_and_audited(self):
         action_id = self._create_expired_action()
         with self.test_pool.connection() as conn:
@@ -970,6 +997,7 @@ class WorkflowConcurrencyTests(unittest.TestCase):
                 "SELECT status FROM incidents WHERE id = %s", (self.incident_id,)
             ).fetchone()["status"]
 
+    # Regression cases ensure incident notes, parsing, and expiry preserve workflow semantics.
     def test_adding_a_note_does_not_skip_triage(self):
         from app.schemas import NoteIn
 
@@ -1047,6 +1075,8 @@ class WorkflowConcurrencyTests(unittest.TestCase):
             self.action_jobs.adapters, "execute", return_value=(True, "Test action completed")
         ):
             self.assertTrue(self.action_jobs.process_one_job())
+
+
 
 
 if __name__ == "__main__":
