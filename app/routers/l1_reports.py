@@ -1,39 +1,33 @@
 """L1 triage reports: the AI drafts one for a new incident, tier 1 reviews
-it, and approving it is the triage decision itself."""
+it, and approving it is the triage decision itself. The AI agent and
+analysts can append notes to a report at any time."""
+import json
 from ipaddress import ip_address
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import PlainTextResponse
 from psycopg.types.json import Jsonb
+from pydantic import ValidationError
 
 from ..db import pool
 from ..deps import get_current_user, require_ai_key, require_roles
 from ..evidence_validation import validate_evidence
 from ..intel_lookup import lookup_ip
 from ..l1_report_format import render
-from ..schemas import L1RejectIn, L1ReportIn, L1ReviewIn
+from ..schemas import L1RejectIn, L1ReportContent, L1ReportIn, L1ReviewIn, NoteIn
 from .incidents import apply_triage
 
 router = APIRouter(prefix="/l1-reports", tags=["l1-reports"])
 
 TRIAGE_ROLES = ("tier1", "tier2", "tier3", "admin")
-EDITABLE_FIELDS = (
-    "verdict",
-    "confidence",
-    "severity",
-    "summary",
-    "escalation_reason",
-    "false_positive_reason",
-    "recommended_actions",
-)
 MAX_REPUTATION_LOOKUPS = 5  # keeps a report submission fast even with many IPs
 
 
 
 
 # Facts the AI can't make up: reputation of public IPs, when each IP was
-# first seen, and how many other incidents involved it.
+# first seen, its recent alert volume, and how many other incidents involved it.
 def _enrich(conn, incident_id: int, indicators: list[dict]) -> dict:
     enrichment = {}
     lookups = 0
@@ -41,6 +35,9 @@ def _enrich(conn, incident_id: int, indicators: list[dict]) -> dict:
         history = conn.execute(
             """
             SELECT min(COALESCE(event_time, ingested_at)) AS first_seen,
+                   count(*) FILTER (
+                       WHERE COALESCE(event_time, ingested_at) > now() - interval '7 days'
+                   ) AS alerts_last_7_days,
                    count(DISTINCT incident_id) FILTER (WHERE incident_id <> %s) AS other_incidents
             FROM alerts
             WHERE src_ip = %s::inet OR dst_ip = %s::inet
@@ -59,6 +56,7 @@ def _enrich(conn, incident_id: int, indicators: list[dict]) -> dict:
             "internal": internal,
             "threat_intel": threat_intel,
             "first_seen": history["first_seen"].isoformat() if history["first_seen"] else None,
+            "alerts_last_7_days": history["alerts_last_7_days"],
             "other_incidents": history["other_incidents"],
         }
     return enrichment
@@ -83,10 +81,48 @@ def _load(conn, report_id: int) -> dict:
 
 
 
+# A report's notes, oldest first, with each analyst's username and role.
+def _notes(conn, report_id: int) -> list[dict]:
+    return conn.execute(
+        """
+        SELECT n.id, n.author_type, n.body, n.created_at, u.username AS author, u.role AS author_role
+        FROM l1_report_notes n LEFT JOIN users u ON u.id = n.author_id
+        WHERE n.report_id = %s
+        ORDER BY n.created_at, n.id
+        """,
+        (report_id,),
+    ).fetchall()
+
+
+
+
+# Append one note to a report and record it in the audit log.
+def _add_note(report_id: int, author_type: str, author_id: int | None, body: str) -> dict:
+    with pool.connection() as conn:
+        _load(conn, report_id)
+        note = conn.execute(
+            """
+            INSERT INTO l1_report_notes (report_id, author_type, author_id, body)
+            VALUES (%s, %s, %s, %s) RETURNING *
+            """,
+            (report_id, author_type, author_id, body),
+        ).fetchone()
+        conn.execute(
+            """
+            INSERT INTO audit_log (actor_type, actor_id, event_type, entity_type, entity_id, details)
+            VALUES (%s, %s, 'l1_report.note_added', 'l1_report', %s, %s)
+            """,
+            (author_type, author_id, report_id, Jsonb({"note_id": note["id"]})),
+        )
+    return note
+
+
+
+
 # The AI submits its draft; the incident is untouched until tier 1 approves.
 @router.post("", dependencies=[Depends(require_ai_key)], status_code=201)
 def submit_report(report: L1ReportIn):
-    draft = report.model_dump(mode="json")
+    content = report.model_dump(mode="json", exclude={"incident_id", "evidence_alert_ids"})
     evidence_ids = sorted(set(report.evidence_alert_ids))
 
     with pool.connection() as conn:
@@ -111,27 +147,20 @@ def submit_report(report: L1ReportIn):
         row = conn.execute(
             """
             INSERT INTO l1_reports
-                (incident_id, verdict, confidence, severity, summary, affected_assets,
-                 indicators, evidence_alert_ids, enrichment, recommended_actions,
-                 escalation_reason, false_positive_reason, ai_draft)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                (incident_id, verdict, severity, category, content, evidence_alert_ids, enrichment, ai_draft)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (incident_id) WHERE status = 'pending_review' DO NOTHING
             RETURNING *
             """,
             (
                 report.incident_id,
                 report.verdict,
-                report.confidence,
                 report.severity,
-                report.summary,
-                Jsonb(draft["affected_assets"]),
-                Jsonb(draft["indicators"]),
+                report.category,
+                Jsonb(content),
                 evidence_ids,
-                Jsonb(_enrich(conn, report.incident_id, draft["indicators"])),
-                Jsonb(draft["recommended_actions"]),
-                report.escalation_reason,
-                report.false_positive_reason,
-                Jsonb(draft),
+                Jsonb(_enrich(conn, report.incident_id, content["indicators"])),
+                Jsonb(content),
             ),
         ).fetchone()
         if row is None:
@@ -202,11 +231,11 @@ def report_metrics(user: dict = Depends(get_current_user)):
 
 
 
-# One report as JSON.
+# One report as JSON, with its notes.
 @router.get("/{report_id}")
 def get_report(report_id: int, user: dict = Depends(get_current_user)):
     with pool.connection() as conn:
-        return _load(conn, report_id)
+        return {**_load(conn, report_id), "notes": _notes(conn, report_id)}
 
 
 
@@ -234,13 +263,14 @@ def get_report_text(report_id: int, user: dict = Depends(get_current_user)) -> s
             """,
             (report["incident_id"],),
         ).fetchall()
-    return render(report, incident, alerts, actions)
+        notes = _notes(conn, report_id)
+    return render(report, incident, alerts, actions, notes)
 
 
 
 
-# Approve a draft (optionally correcting it). This triages the incident: a
-# true positive goes to tier 2, a false positive is closed.
+# Approve a draft, optionally correcting any field first. This triages the
+# incident: a true positive goes to tier 2, a false positive is closed.
 @router.post("/{report_id}/approve")
 def approve_report(report_id: int, review: L1ReviewIn, user: dict = Depends(require_roles(*TRIAGE_ROLES))):
     with pool.connection() as conn:
@@ -252,36 +282,41 @@ def approve_report(report_id: int, review: L1ReviewIn, user: dict = Depends(requ
         if report["status"] != "pending_review":
             raise HTTPException(status_code=409, detail=f"Report is already {report['status']}")
 
-        edits = review.model_dump(include=set(EDITABLE_FIELDS), exclude_none=True)
-        final = {field: edits.get(field, report[field]) for field in EDITABLE_FIELDS}
-        changes = [field for field in EDITABLE_FIELDS if field in edits and edits[field] != report[field]]
-        true_positive = final["verdict"] == "true_positive"
-        reason = final["escalation_reason"] if true_positive else final["false_positive_reason"]
-        if not reason:
-            field = "escalation_reason" if true_positive else "false_positive_reason"
-            raise HTTPException(status_code=422, detail=f"A {final['verdict']} report needs a {field}")
+        try:
+            final = L1ReportContent.model_validate({**report["content"], **review.changes})
+        except ValidationError as error:
+            raise HTTPException(status_code=422, detail=json.loads(error.json(include_url=False))) from None
+        content = final.model_dump(mode="json")
+        changes = [
+            field
+            for field in L1ReportContent.model_fields
+            if field in review.changes and content[field] != report["content"].get(field)
+        ]
+        true_positive = final.verdict == "true_positive"
 
-        triage = apply_triage(conn, report["incident_id"], user["id"], true_positive, reason)
+        triage = apply_triage(
+            conn,
+            report["incident_id"],
+            user["id"],
+            true_positive,
+            final.escalation_reason if true_positive else final.false_positive_reason,
+        )
         conn.execute(
             "UPDATE incidents SET severity = %s, ai_summary = %s, updated_at = now() WHERE id = %s",
-            (final["severity"], final["summary"], report["incident_id"]),
+            (final.severity, final.summary, report["incident_id"]),
         )
         conn.execute(
             """
             UPDATE l1_reports
-            SET status = 'approved', verdict = %s, confidence = %s, severity = %s, summary = %s,
-                escalation_reason = %s, false_positive_reason = %s, recommended_actions = %s,
+            SET status = 'approved', verdict = %s, severity = %s, category = %s, content = %s,
                 reviewer_changes = %s, reviewed_by = %s, reviewed_at = now(), review_comment = %s
             WHERE id = %s
             """,
             (
-                final["verdict"],
-                final["confidence"],
-                final["severity"],
-                final["summary"],
-                final["escalation_reason"],
-                final["false_positive_reason"],
-                Jsonb(final["recommended_actions"]),
+                final.verdict,
+                final.severity,
+                final.category,
+                Jsonb(content),
                 changes,
                 user["id"],
                 review.comment,
@@ -293,14 +328,14 @@ def approve_report(report_id: int, review: L1ReviewIn, user: dict = Depends(requ
             INSERT INTO audit_log (actor_type, actor_id, event_type, entity_type, entity_id, details)
             VALUES ('user', %s, 'l1_report.approved', 'l1_report', %s, %s)
             """,
-            (user["id"], report_id, Jsonb({"verdict": final["verdict"], "reviewer_changes": changes})),
+            (user["id"], report_id, Jsonb({"verdict": final.verdict, "reviewer_changes": changes})),
         )
 
     return {
         "report_id": report_id,
         "incident_id": report["incident_id"],
         "incident_status": triage["status"],
-        "verdict": final["verdict"],
+        "verdict": final.verdict,
         "reviewer_changes": changes,
     }
 
@@ -334,3 +369,19 @@ def reject_report(report_id: int, body: L1RejectIn, user: dict = Depends(require
         )
 
     return {"report_id": report_id, "incident_id": row["incident_id"], "status": "rejected"}
+
+
+
+
+# An analyst adds a note, e.g. something found after the report was written.
+@router.post("/{report_id}/notes", status_code=201)
+def add_analyst_note(report_id: int, note: NoteIn, user: dict = Depends(require_roles(*TRIAGE_ROLES))):
+    return _add_note(report_id, "user", user["id"], note.body)
+
+
+
+
+# The AI agent adds a note, e.g. new evidence that arrived after its draft.
+@router.post("/{report_id}/notes/ai", dependencies=[Depends(require_ai_key)], status_code=201)
+def add_ai_note(report_id: int, note: NoteIn):
+    return _add_note(report_id, "ai", None, note.body)

@@ -1,9 +1,16 @@
-"""Plain-text rendering of an L1 report, in the layout tier 1 hands to tier 2."""
+"""Plain-text rendering of an L1 report, in the layout tier 1 hands to tier 2.
+
+The layout combines what real SOC escalation tickets have in common: the
+five Ws, a UTC timeline, an impact assessment, indicators with reputation,
+MITRE ATT&CK mapping, investigation steps, open questions for tier 2, and a
+notes area for anything added later.
+"""
 import textwrap
 from datetime import datetime, timezone
 
 WIDTH = 78
 DASH = "\u2014"
+NONE = "None recorded."
 SEVERITY_LABELS = {1: "Critical", 2: "High", 3: "Medium", 4: "Low", 5: "Informational"}
 PRIORITIES = {1: "P1", 2: "P2", 3: "P3", 4: "P4", 5: "P4"}
 STATUS_LINES = {
@@ -15,26 +22,62 @@ STATUS_LINES = {
 
 
 
-# Format a timestamp (datetime or ISO string) the same way everywhere.
+# Accept a datetime or an ISO string, always returning an aware datetime.
+def _as_datetime(value) -> datetime:
+    if isinstance(value, str):
+        value = datetime.fromisoformat(value)
+    return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+
+
+
+# Format a timestamp the same way everywhere.
 def _time(value) -> str:
     if value is None:
         return "pending"
-    if isinstance(value, str):
-        value = datetime.fromisoformat(value)
-    return value.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    return _as_datetime(value).astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 
 
 
-# Wrap free text to the report width.
-def _wrap(text: str | None) -> list[str]:
-    return textwrap.wrap(text, WIDTH) if text else []
+# Wrap a paragraph to the report width.
+def _wrap(text: str | None, indent: str = "") -> list[str]:
+    return textwrap.wrap(text, WIDTH, initial_indent=indent, subsequent_indent=indent) if text else []
 
 
 
 
-# "- srv-web-01 (10.20.1.15), user account: deploy, public web server, criticality: high"
-def _asset_line(asset: dict) -> str:
+# Wrap one list item, indenting continuation lines under its text.
+def _bullet(text: str, prefix: str = "- ") -> list[str]:
+    return textwrap.wrap(text, WIDTH, initial_indent=prefix, subsequent_indent=" " * len(prefix))
+
+
+
+
+# "brute_force" -> "Brute force"
+def _label(value: str) -> str:
+    return value.replace("_", " ").capitalize()
+
+
+
+
+# "abuseipdb: malicious, virustotal: not configured"
+def _reputation(info: dict) -> str:
+    if info.get("internal"):
+        return "internal address, no reputation lookup"
+    if not info["threat_intel"]:
+        return "no reputation lookup"
+    return ", ".join(
+        f"{result['provider']}: "
+        + (result["verdict"] if result["status"] == "ok" else result["status"].replace("_", " "))
+        for result in info["threat_intel"]
+    )
+
+
+
+
+# "srv-web-01 (10.20.1.15), user account: deploy \u2014 public web server, criticality: high"
+def _asset_text(asset: dict) -> str:
     name = asset.get("hostname") or asset.get("ip") or ""
     if asset.get("hostname") and asset.get("ip"):
         name += f" ({asset['ip']})"
@@ -42,103 +85,202 @@ def _asset_line(asset: dict) -> str:
         name = f"{name}, user account: {asset['user']}" if name else f"user account: {asset['user']}"
     details = [asset.get("role"), asset.get("criticality") and f"criticality: {asset['criticality']}"]
     details = [detail for detail in details if detail]
-    return f"- {name}" + (f" {DASH} {', '.join(details)}" if details else "")
+    return name + (f" {DASH} {', '.join(details)}" if details else "")
 
 
 
 
-# "- 203.0.113.45: abuseipdb: malicious; first seen ...; no other incidents"
-def _enrichment_line(ip: str, info: dict) -> str:
-    if info.get("internal"):
-        reputation = "internal address, no reputation lookup"
-    elif info["threat_intel"]:
-        reputation = ", ".join(
-            f"{result['provider']}: "
-            + (result["verdict"] if result["status"] == "ok" else result["status"].replace("_", " "))
-            for result in info["threat_intel"]
-        )
-    else:
-        reputation = "no reputation lookup"
-    seen = f"first seen {_time(info['first_seen'])}" if info["first_seen"] else "not seen in any alert"
-    others = info["other_incidents"]
-    history = "no other incidents" if others == 0 else f"{others} other incident(s)"
-    return f"- {ip}: {reputation}; {seen}; {history}"
-
-
-
-
-# "- block_ip 203.0.113.45: in effect"
-def _action_line(action: dict) -> str:
+# "block_ip 203.0.113.45: in effect"
+def _action_text(action: dict) -> str:
     if action["reverted_at"]:
         state = "reverted"
     elif action["success"] is None:
         state = "queued"
     else:
         state = "in effect" if action["success"] else "failed"
-    return f"- {action['action_type']} {action['target_value']}: {state}"
+    return f"{action['action_type']} {action['target_value']}: {state}"
 
 
 
 
-# Render one report. alerts are all of the incident's alerts; actions are
-# the response actions already queued or taken for it.
-def render(report: dict, incident: dict, alerts: list[dict], actions: list[dict]) -> str:
-    escalated = report["verdict"] == "true_positive"
-    severity = report["severity"]
+# Render one report. alerts are all of the incident's alerts, actions the
+# response actions queued or taken for it, notes the report's addenda.
+def render(report: dict, incident: dict, alerts: list[dict], actions: list[dict], notes: list[dict]) -> str:
+    content = report["content"]
+    escalated = content["verdict"] == "true_positive"
+    severity = content["severity"]
     reviewer = report.get("reviewer")
+    reason = content["escalation_reason"] if escalated else content["false_positive_reason"]
     evidence_ids = set(report["evidence_alert_ids"])
     evidence = [alert for alert in alerts if alert["id"] in evidence_ids]
-    title = "L1 ESCALATION REPORT" if escalated else "L1 TRIAGE: CLOSED AS FALSE POSITIVE"
+    seen = sorted(_as_datetime(alert["seen_at"]) for alert in evidence)
+    window = f"{_time(seen[0])} to {_time(seen[-1])}" if seen else None
+    assets = content["affected_assets"]
+    users = list(dict.fromkeys(
+        [asset["user"] for asset in assets if asset.get("user")]
+        + [item["value"] for item in content["indicators"] if item["type"] == "user"]
+    ))
+    places = list(dict.fromkeys(asset.get("hostname") or asset.get("ip") for asset in assets if asset.get("hostname") or asset.get("ip")))
+    signatures = list(dict.fromkeys(alert["signature"] or "unnamed detection" for alert in evidence))
 
+    title = "L1 ESCALATION REPORT" if escalated else "L1 TRIAGE: CLOSED AS FALSE POSITIVE"
     lines = [
         f"INCIDENT #{incident['id']} {DASH} {title}",
-        "Status: " + STATUS_LINES[report["status"]].format(reviewer=reviewer),
-        f"Detected: {_time(incident['created_at'])}      Triaged: {_time(report['reviewed_at'])}",
-        f"Analyst: {reviewer or DASH}      "
-        f"Severity: {severity} ({SEVERITY_LABELS[severity]})   Priority: {PRIORITIES[severity]}",
+        f"Report #{report['id']} | Status: "
+        + STATUS_LINES[report["status"]].format(reviewer=reviewer)
+        + f" | TLP:{content['tlp']}",
+        f"Category: {_label(content['category'])} | Attacker: {_label(content['attacker'])} | "
+        + ("Escalated to: Tier 2" if escalated else "Closed by: Tier 1"),
+        f"Detected: {_time(incident['created_at'])} | Triaged: {_time(report['reviewed_at'])}",
+        f"Analyst: {reviewer or DASH} | Severity: {severity} ({SEVERITY_LABELS[severity]}) | "
+        f"Priority: {PRIORITIES[severity]} | Confidence: {content['confidence'].upper()}",
     ]
+    number = 0
 
-    def section(heading: str, body: list[str]) -> None:
-        lines.extend(["", heading, *(body or ["None"])])
+    def section(heading: str, body: list[str], empty: str = NONE) -> None:
+        nonlocal number
+        number += 1
+        lines.extend(["", f"{number}. {heading}", *(body or [empty])])
 
-    section("SUMMARY", _wrap(report["summary"]))
-    verdict = "True positive" if escalated else "False positive"
-    section(
-        "L1 VERDICT",
-        [
-            f"{verdict} {DASH} confidence {report['confidence'].upper()}",
-            *([] if escalated else _wrap(report["false_positive_reason"])),
-        ],
-    )
-    triggers = dict.fromkeys(
-        f"{alert['signature'] or 'unnamed detection'} (source: {alert['source']})" for alert in evidence
-    )
-    section("TRIGGER", [*triggers, f"Alerts on this incident: {len(alerts)} (cited as evidence: {len(evidence)})"])
-    section("AFFECTED ASSETS", [_asset_line(asset) for asset in report["affected_assets"]])
-    section("INDICATORS", [f"- {item['type']}: {item['value']}" for item in report["indicators"]])
-    section(
-        "EVIDENCE",
-        [
-            f"- {alert['id']}: {alert['signature'] or 'unnamed detection'}, "
+    section("EXECUTIVE SUMMARY", _wrap(content["summary"]))
+
+    ws = content["five_ws"]
+    five_ws = [
+        ("Who", ws["who"] or ", ".join(users) or "Not identified"),
+        ("What", ws["what"] or ", ".join(signatures) or "Not described"),
+        ("When", ws["when"] or (f"Activity window {window}" if window else "Unknown")),
+        ("Where", ws["where"] or ", ".join(places) or "Not identified"),
+        ("Why", ws["why"] or reason),
+    ]
+    section("AT A GLANCE (FIVE Ws)", [line for label, text in five_ws for line in _bullet(text, f"{label + ':':<7}")])
+
+    section("L1 VERDICT", [
+        f"{'True positive' if escalated else 'False positive'} {DASH} confidence {content['confidence'].upper()}",
+        *_wrap(reason),
+    ])
+
+    section("DETECTION", [
+        *(f"- {alert['signature'] or 'unnamed detection'} (source: {alert['source']})"
+          for alert in {f"{a['signature']}|{a['source']}": a for a in evidence}.values()),
+        f"Alerts on this incident: {len(alerts)} (cited as evidence: {len(evidence)})",
+        f"Activity window: {window or 'unknown'}",
+    ])
+
+    events = [(item["time"], item["event"], item.get("source")) for item in content["timeline"]]
+    events.append((incident["created_at"], "Incident opened by alert correlation", "SOC platform"))
+    events.append((report["created_at"], "AI drafted this L1 report", "SOC platform"))
+    if report["reviewed_at"]:
+        verb = "approved" if report["status"] == "approved" else "rejected"
+        events.append((report["reviewed_at"], f"Tier 1 {verb} the report ({reviewer})", "SOC platform"))
+    events.sort(key=lambda event: _as_datetime(event[0]))
+    section("TIMELINE (UTC)", [
+        line
+        for time, event, source in events
+        for line in _bullet(event + (f" [{source}]" if source else ""), f"{_time(time)}  ")
+    ])
+
+    section("AFFECTED ASSETS", [line for asset in assets for line in _bullet(_asset_text(asset))])
+
+    impact = content["impact"]
+    exposure = _label(impact["data_exposure"])
+    if impact["data_types"]:
+        exposure += " (" + ", ".join(_label(kind) for kind in impact["data_types"]) + ")"
+    section("IMPACT ASSESSMENT", [
+        *_bullet(impact["business_impact"] or "Not assessed", "Business impact: "),
+        f"Data exposure: {exposure}",
+        "CIA affected: " + (", ".join(_label(item) for item in impact["cia_affected"]) or "Not assessed"),
+        *_bullet(", ".join(impact["affected_services"]) or "None identified", "Affected services: "),
+        f"Scope: {len(places)} host(s)/address(es), {len(users)} user account(s)",
+    ])
+
+    def indicator_text(item: dict) -> str:
+        text = f"{item['type']}: {item['value']}"
+        if item.get("context"):
+            text += f" {DASH} {item['context']}"
+        info = report["enrichment"].get(item["value"]) if item["type"] == "ip" else None
+        return text + (f" [{_reputation(info)}]" if info else "")
+
+    section("INDICATORS OF COMPROMISE", [line for item in content["indicators"] for line in _bullet(indicator_text(item))])
+
+    section("MITRE ATT&CK", [
+        f"- {technique['technique_id']} {technique['name']}"
+        + (f" ({technique['tactic']})" if technique["tactic"] else "")
+        for technique in content["mitre_attack"]
+    ])
+
+    evidence_lines = [
+        line
+        for alert in evidence
+        for line in _bullet(
+            f"{alert['id']}: {alert['signature'] or 'unnamed detection'}, "
             f"{alert['src_ip'] or '?'} -> {alert['dst_ip'] or '?'} at {_time(alert['seen_at'])}"
-            for alert in evidence
-        ],
-    )
-    section("ENRICHMENT", [_enrichment_line(ip, info) for ip, info in report["enrichment"].items()])
-    section("ACTIONS TAKEN", [_action_line(action) for action in actions])
+        )
+    ]
+    for excerpt in content["log_excerpts"]:
+        evidence_lines += ["", f"Log excerpt [{excerpt['source']}]:", *(f"    {line}" for line in excerpt["excerpt"].splitlines())]
+    section("EVIDENCE", evidence_lines)
 
-    recommendations = [f"- {action}" for action in report["recommended_actions"]]
+    steps = []
+    for index, step in enumerate(content["investigation_steps"], 1):
+        steps += _bullet(step["check"], f"{index}. ") + _bullet(step["result"], "   Finding: ")
+    section("INVESTIGATION STEPS", steps)
+
+    section("CONTEXT CHECKS", [
+        line for check in content["context_checks"] for line in _bullet(f"{check['check']}: {check['result']}")
+    ])
+
+    section("ENRICHMENT (VERIFIED BY THE BACKEND)", [
+        line
+        for ip, info in report["enrichment"].items()
+        for line in _bullet(
+            f"{ip}: {_reputation(info)}; "
+            + (f"first seen {_time(info['first_seen'])}" if info["first_seen"] else "not seen in any alert")
+            + f"; {info['alerts_last_7_days']} alert(s) in the last 7 days; "
+            + ("no other incidents" if info["other_incidents"] == 0 else f"{info['other_incidents']} other incident(s)")
+        )
+    ])
+
+    section("ACTIONS TAKEN", [
+        *(line for text in content["actions_taken"] for line in _bullet(text, "- [L1] ")),
+        *(line for action in actions for line in _bullet(_action_text(action), "- [response] ")),
+    ], empty="None.")
+
+    next_steps = [line for text in content["recommended_actions"] for line in _bullet(text)]
     if escalated:
-        section("ESCALATION REASON / RECOMMENDATION", [*_wrap(report["escalation_reason"]), *recommendations])
+        section("ESCALATION REASON AND NEXT STEPS", [*_wrap(reason), *next_steps])
     else:
-        section("RECOMMENDATION", recommendations)
+        section("RECOMMENDED NEXT STEPS", next_steps)
 
-    notes = []
+    section(
+        "OPEN QUESTIONS FOR TIER 2" if escalated else "OPEN QUESTIONS",
+        [line for question in content["open_questions"] for line in _bullet(question)],
+        empty="None.",
+    )
+
+    section("NOTIFICATIONS", [
+        line for item in content["notifications"] for line in _bullet(f"{item['audience']}: {item['reason']}")
+    ], empty="None required.")
+
+    if not escalated:
+        tuning = content["tuning_recommendation"]
+        section("FALSE POSITIVE TUNING", [
+            *_bullet(content["false_positive_pattern"] or "Not described", "Pattern: "),
+            "Recommendation: " + (_label(tuning) if tuning else "None"),
+        ])
+
+    review = []
     if report["reviewer_changes"]:
-        notes.append("Changed from the AI draft: " + ", ".join(report["reviewer_changes"]))
-    if report["ai_draft"]["verdict"] != report["verdict"]:
-        notes.append(f"The AI originally judged this a {report['ai_draft']['verdict'].replace('_', ' ')}.")
-    notes += _wrap(report["review_comment"])
-    if notes:
-        section("L1 REVIEW NOTES", notes)
+        review += _bullet("Changed from the AI draft: " + ", ".join(report["reviewer_changes"]), "")
+    if report["ai_draft"]["verdict"] != content["verdict"]:
+        review.append(f"The AI originally judged this a {report['ai_draft']['verdict'].replace('_', ' ')}.")
+    review += _wrap(report["review_comment"])
+    if review:
+        section("L1 REVIEW", review)
+
+    note_lines = []
+    for note in notes:
+        author = "AI agent" if note["author_type"] == "ai" else f"{note['author']} ({note['author_role']})"
+        note_lines += [f"[{_time(note['created_at'])}] {author}:", *_wrap(note["body"], "  ")]
+    section("NOTES", note_lines, empty="No notes yet.")
+
     return "\n".join(lines) + "\n"

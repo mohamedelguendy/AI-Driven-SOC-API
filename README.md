@@ -140,6 +140,7 @@ limits an IP/username pair to 10 attempts per 15-minute window.
 | `GET /l1-reports/{id}/text` | The report as a plain-text handoff document |
 | `POST /l1-reports/{id}/approve` | Tier1 approves (optionally corrects) the draft; this triages the incident |
 | `POST /l1-reports/{id}/reject` | Tier1 sends the draft back with a comment |
+| `POST /l1-reports/{id}/notes` | An analyst adds a note to a report (`/notes/ai` for the AI agent) |
 | `GET /l1-reports/metrics` | Review counts, AI verdict agreement, MTTA |
 | `POST /analysis/classify` | Rule-based severity/priority suggestion for tier1 |
 | `GET /threat-intel/{ip}` | IP reputation (AbuseIPDB / VirusTotal), cached 1 hour |
@@ -180,24 +181,43 @@ docstring in `ingest_ids_engine.py`.
 ## L1 reports
 
 For every new incident the AI drafts a tier 1 triage report. A tier 1 analyst
-reviews it, and approving it *is* the triage decision.
+reviews it, and approving it *is* the triage decision. The report combines
+what real SOC escalation tickets have in common:
 
-1. The AI sends `POST /l1-reports` with a verdict (`true_positive` or
-   `false_positive`), confidence, severity (1 = critical ... 5 =
-   informational), summary, affected assets, indicators, the alert IDs it
-   relies on, recommended actions, and an `escalation_reason` (true positive)
-   or `false_positive_reason`. Cited alerts must belong to the incident, and
-   only one draft per incident can await review at a time.
-2. The backend adds facts the AI can't invent: reputation of public IPs
-   (internal ones are never sent to a provider), when each IP was first seen,
-   and how many other incidents involved it.
-3. Tier 1 reads `GET /l1-reports/{id}/text` and either approves it with
-   `POST /l1-reports/{id}/approve` (any field can be corrected first) or sends
-   it back with `POST /l1-reports/{id}/reject` and a comment. A rejected draft
-   leaves the incident `new` for a corrected one.
-4. Approval triages the incident: a true positive goes to tier 2
+| Part | What it holds |
+|---|---|
+| Header | incident/report IDs, status, TLP, category, attacker type, detected/triaged times, severity, priority, confidence |
+| Executive summary | two or three plain sentences |
+| Five Ws | who, what, when, where, why (filled from the evidence if the AI leaves them out) |
+| Verdict | true/false positive, confidence, and the reasoning |
+| Detection | triggering rules and tools, alert counts, activity window |
+| Timeline (UTC) | the AI's events merged with platform events (incident opened, draft, review) |
+| Affected assets and impact | hosts/users and their criticality; business impact, data exposure, CIA affected |
+| Indicators and MITRE ATT&CK | IOCs with context and reputation; technique IDs (e.g. `T1110.001`) |
+| Evidence | the cited alerts plus raw log excerpts |
+| Investigation steps and context checks | what was checked and what it showed (known FP? maintenance window? recent alerts?) |
+| Enrichment | backend-verified: IP reputation (public IPs only), first seen, alerts in the last 7 days, other incidents |
+| Actions, next steps, open questions | what L1 already did, response actions, recommendations, what tier 2 should find out |
+| Notifications / FP tuning | who must be told; for false positives, the pattern and tuning advice |
+| Notes | timestamped notes the AI agent or analysts add at any time; they can't be edited or deleted |
+
+Flow:
+
+1. The AI sends `POST /l1-reports`. Only `incident_id`, `evidence_alert_ids`,
+   `verdict`, `confidence`, `severity`, `summary` and the matching reason
+   (`escalation_reason` or `false_positive_reason`) are required; every other
+   part is optional. Cited alerts must belong to the incident, unknown fields
+   are rejected, and only one draft per incident can await review at a time.
+2. Tier 1 reads `GET /l1-reports/{id}/text` and either approves it with
+   `POST /l1-reports/{id}/approve` or sends it back with
+   `POST /l1-reports/{id}/reject` and a comment. To correct the draft while
+   approving, send the changed fields: `{"changes": {"severity": 2}, "comment": "..."}`.
+3. Approval triages the incident: a true positive goes to tier 2
    (`investigating`), a false positive is `closed`. The incident takes the
    report's severity and summary.
+4. Anyone can add context later: the AI agent with
+   `POST /l1-reports/{id}/notes/ai`, analysts with `POST /l1-reports/{id}/notes`
+   (body: `{"body": "..."}`).
 
 The AI's original draft is kept next to the approved version, so
 `GET /l1-reports/metrics` can show how often tier 1 agreed with the AI.
@@ -207,14 +227,24 @@ Example draft:
 ```json
 {
   "incident_id": 1042,
+  "evidence_alert_ids": [8812, 8820, 8821],
   "verdict": "true_positive",
   "confidence": "high",
   "severity": 2,
+  "category": "brute_force",
+  "attacker": "external",
   "summary": "External IP made 312 failed SSH logins against srv-web-01, then logged in as 'deploy'.",
-  "affected_assets": [{"hostname": "srv-web-01", "ip": "10.20.1.15", "role": "public web server", "criticality": "high"}],
-  "indicators": [{"type": "ip", "value": "203.0.113.45"}, {"type": "port", "value": "22"}],
-  "evidence_alert_ids": [8812, 8820, 8821],
+  "affected_assets": [{"hostname": "srv-web-01", "ip": "10.20.1.15", "user": "deploy", "role": "public web server", "criticality": "high"}],
+  "indicators": [{"type": "ip", "value": "203.0.113.45", "context": "brute-force source"}],
+  "mitre_attack": [{"technique_id": "T1110.001", "name": "Password Guessing", "tactic": "Credential Access"}],
+  "timeline": [{"time": "2026-10-30T14:08:41Z", "event": "Successful login as deploy", "source": "auth.log"}],
+  "investigation_steps": [{"check": "Reviewed auth.log on srv-web-01", "result": "312 failures, then one success"}],
+  "context_checks": [{"check": "Maintenance window", "result": "None scheduled"}],
+  "impact": {"data_exposure": "suspected", "data_types": ["credentials"], "cia_affected": ["confidentiality"]},
+  "log_excerpts": [{"source": "auth.log", "excerpt": "Accepted password for deploy from 203.0.113.45 port 51122 ssh2"}],
   "recommended_actions": ["Block 203.0.113.45", "Isolate srv-web-01", "Reset credentials for deploy"],
+  "open_questions": ["Did the session run any commands?"],
+  "notifications": [{"audience": "Asset owner", "reason": "Service account may be compromised"}],
   "escalation_reason": "Successful login after brute force plus an outbound connection suggests a live session."
 }
 ```

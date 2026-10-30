@@ -1154,6 +1154,7 @@ class WorkflowConcurrencyTests(unittest.TestCase):
                 verdict=verdict,
                 confidence="high",
                 severity=3,
+                category="brute_force",
                 summary="Repeated failed SSH logins followed by a successful one.",
                 indicators=[{"type": "ip", "value": self.target_value}],
                 evidence_alert_ids=[alert_id],
@@ -1171,7 +1172,7 @@ class WorkflowConcurrencyTests(unittest.TestCase):
         self.assertIn(self.target_value, report["enrichment"])
 
         result = self.l1_reports.approve_report(
-            report["id"], L1ReviewIn(severity=2), {"id": self.user_id, "role": "tier1"}
+            report["id"], L1ReviewIn(changes={"severity": 2}), {"id": self.user_id, "role": "tier1"}
         )
 
         self.assertEqual(result["incident_status"], "investigating")
@@ -1181,7 +1182,7 @@ class WorkflowConcurrencyTests(unittest.TestCase):
                 "SELECT severity, ai_summary, triaged_at FROM incidents WHERE id = %s", (self.incident_id,)
             ).fetchone()
         self.assertEqual(incident["severity"], 2)
-        self.assertEqual(incident["ai_summary"], report["summary"])
+        self.assertEqual(incident["ai_summary"], report["content"]["summary"])
         self.assertIsNotNone(incident["triaged_at"])
 
     def test_approved_false_positive_l1_report_closes_incident(self):
@@ -1201,17 +1202,18 @@ class WorkflowConcurrencyTests(unittest.TestCase):
         report = self._l1_report()
         user = {"id": self.user_id, "role": "tier1"}
         with self.assertRaises(HTTPException) as error:
-            self.l1_reports.approve_report(report["id"], L1ReviewIn(verdict="false_positive"), user)
+            self.l1_reports.approve_report(report["id"], L1ReviewIn(changes={"verdict": "false_positive"}), user)
         self.assertEqual(error.exception.status_code, 422)
         self.assertEqual(self._incident_status(), "new")
 
         result = self.l1_reports.approve_report(
             report["id"],
-            L1ReviewIn(verdict="false_positive", false_positive_reason="Authorized penetration test"),
+            L1ReviewIn(changes={"verdict": "false_positive", "false_positive_reason": "Authorized penetration test"}),
             user,
         )
 
         self.assertEqual(result["incident_status"], "closed")
+        self.assertEqual(result["reviewer_changes"], ["verdict", "false_positive_reason"])
         text = self.l1_reports.get_report_text(report["id"], user)
         self.assertIn("L1 TRIAGE: CLOSED AS FALSE POSITIVE", text)
         self.assertIn("The AI originally judged this a true positive.", text)
@@ -1241,6 +1243,28 @@ class WorkflowConcurrencyTests(unittest.TestCase):
         self.assertIn("Status: AI draft, awaiting L1 review", text)
         self.assertIn("BRUTE_FORCE_LOGIN (source: ids)", text)
         self.assertGreaterEqual(metrics["pending_review"], 1)
+
+    def test_ai_agent_and_analysts_can_add_notes_at_any_time(self):
+        from app.schemas import L1ReviewIn, NoteIn
+
+        report = self._l1_report()
+        user = {"id": self.user_id, "role": "tier1"}
+        self.l1_reports.add_ai_note(report["id"], NoteIn(body="A second login from the same IP arrived at 14:20."))
+        self.l1_reports.approve_report(report["id"], L1ReviewIn(), user)
+        self.l1_reports.add_analyst_note(report["id"], NoteIn(body="Asset owner confirmed the login was not theirs."), user)
+
+        notes = self.l1_reports.get_report(report["id"], user)["notes"]
+        text = self.l1_reports.get_report_text(report["id"], user)
+
+        self.assertEqual([note["author_type"] for note in notes], ["ai", "user"])
+        self.assertIn("AI agent:", text)
+        self.assertIn("A second login from the same IP arrived at 14:20.", text)
+        self.assertIn("(tier2):", text)
+        with self.assertRaises(HTTPException) as error:
+            self.l1_reports.add_ai_note(999_999_999, NoteIn(body="Lost note"))
+        self.assertEqual(error.exception.status_code, 404)
+        with self.assertRaises(psycopg.errors.RaiseException), self.test_pool.connection() as conn:
+            conn.execute("DELETE FROM l1_report_notes WHERE report_id = %s", (report["id"],))
 
     def test_approved_action_moves_escalated_incident_to_in_response(self):
         recommendation_id = self._create_recommendation()
