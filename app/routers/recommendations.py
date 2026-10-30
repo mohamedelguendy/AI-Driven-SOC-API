@@ -7,6 +7,7 @@ from psycopg.types.json import Jsonb
 from ..config import settings
 from ..db import pool
 from ..deps import get_current_user, require_roles
+from ..evidence_validation import validate_evidence
 from ..schemas import DecisionIn, RecommendationIn
 from ..security import verify_api_key
 
@@ -187,12 +188,22 @@ def create_recommendation(rec: RecommendationIn):
                 detail=f"Incident is already {incident['status']}; no new actions can be recommended",
             )
 
+        # Hallucination check: every alert the AI cites must exist and belong to this incident.
+        evidence_ids = sorted(set(rec.evidence_alert_ids))
+        evidence = validate_evidence(conn, rec.incident_id, evidence_ids)
+        if not evidence["valid"]:
+            raise HTTPException(
+                status_code=422,
+                detail={"message": "Cited evidence failed validation", "errors": evidence["errors"]},
+            )
+
         row = conn.execute(
             """
             INSERT INTO recommendations
                 (incident_id, action_type, executor, target_scope, target_value,
-                 is_internal, is_permanent, duration_secs, reason, risk_score, impact)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 is_internal, is_permanent, duration_secs, reason, risk_score, impact,
+                 evidence_alert_ids)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING *
             """,
             (
@@ -207,6 +218,7 @@ def create_recommendation(rec: RecommendationIn):
                 rec.reason,
                 rec.risk_score,
                 impact,
+                evidence_ids,
             ),
         ).fetchone()
 
@@ -215,7 +227,10 @@ def create_recommendation(rec: RecommendationIn):
             INSERT INTO audit_log (actor_type, event_type, entity_type, entity_id, details)
             VALUES ('ai', 'recommendation.created', 'recommendation', %s, %s)
             """,
-            (row["id"], Jsonb({"impact": impact, "action_type": rec.action_type})),
+            (
+                row["id"],
+                Jsonb({"impact": impact, "action_type": rec.action_type, "evidence_alert_ids": evidence_ids}),
+            ),
         )
 
         if rec.risk_score is not None:
@@ -273,6 +288,11 @@ def approve(
         incident = conn.execute(
             "SELECT status FROM incidents WHERE id = %s", (rec["incident_id"],)
         ).fetchone()
+        if incident["status"] == "new":
+            raise HTTPException(
+                status_code=409,
+                detail="Tier 1 has not triaged this incident yet; actions can only be approved after triage",
+            )
         if incident["status"] in FINISHED_INCIDENT_STATUSES:
             raise HTTPException(
                 status_code=409,

@@ -107,6 +107,7 @@ def triage_incident(
             UPDATE incidents
             SET status = %s,
                 assigned_tier = %s,
+                triaged_at = now(),
                 updated_at = now(),
                 resolved_at = CASE WHEN %s = 'closed' THEN now() ELSE resolved_at END
             WHERE id = %s AND status = 'new'

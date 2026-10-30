@@ -87,7 +87,7 @@ class SecureFirewallAdapterTests(unittest.TestCase):
         self.addCleanup(self.stack.close)
         secure_firewall._session.update(token=None, domain=None, issued_at=0.0, object_id=None, object_name=None)
 
-    def use(self, fmc):
+    def use(self, fmc, mode="live"):
         self.stack.enter_context(
             patch.multiple(
                 settings,
@@ -95,6 +95,7 @@ class SecureFirewallAdapterTests(unittest.TestCase):
                 fmc_username="soc-api",
                 fmc_password="secret",
                 fmc_dynamic_object="SOC-Blocked-IPs",
+                firewall_execution_mode=mode,
             )
         )
         self.stack.enter_context(patch.object(secure_firewall.requests, "post", fmc.login))
@@ -170,6 +171,19 @@ class SecureFirewallAdapterTests(unittest.TestCase):
         self.assertIn("not attempted", message)
         self.assertEqual(fmc.logins, 0)
 
+    def test_dry_run_reads_but_never_writes(self):
+        fmc = FakeFMC(mappings=["198.51.100.1"])
+        self.use(fmc, mode="dry_run")
+
+        with patch.object(settings, "firewall_mode", "fmc"):
+            success, message = adapters.execute("firewall", self.command)
+
+        self.assertTrue(success, message)
+        self.assertTrue(message.startswith(adapters.DRY_RUN_PREFIX))
+        self.assertEqual(fmc.logins, 1)  # it really talked to the FMC
+        self.assertEqual(fmc.changes, [])
+        self.assertEqual(fmc.mappings, ["198.51.100.1"])
+
     def test_firewall_mode_selects_the_adapter(self):
         with patch.object(settings, "firewall_mode", "fmc"):
             self.assertIs(adapters._adapter_for("firewall"), secure_firewall)
@@ -183,6 +197,7 @@ class SecureFirewallAdapterTests(unittest.TestCase):
             target_value="445",
             reason="Regression test",
             duration_secs=60,
+            evidence_alert_ids=[1],
         )
         with patch.object(settings, "firewall_mode", "fmc"), self.assertRaises(HTTPException) as error:
             recommendations.create_recommendation(recommendation)

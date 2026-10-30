@@ -60,6 +60,7 @@ class InputValidationTests(unittest.TestCase):
             "target_scope": "single_ip",
             "target_value": "203.0.113.7",
             "reason": "Regression test",
+            "evidence_alert_ids": [1],
         }
 
         for duration in (0, -1):
@@ -77,6 +78,7 @@ class InputValidationTests(unittest.TestCase):
             "target_value": "203.0.113.7",
             "reason": "Regression test",
             "duration_secs": 1,
+            "evidence_alert_ids": [1],
         }
 
         for risk_score in (-1, 101):
@@ -295,6 +297,7 @@ class WorkflowConcurrencyTests(unittest.TestCase):
                 "006_login_rate_limits.sql",
                 "007_alert_ingest_idempotency.sql",
                 "008_action_job_leases.sql",
+                "009_evidence_and_triage_time.sql",
             ):
                 migration_path = migration_dir / migration_name
                 conn.execute(migration_path.read_text(encoding="utf-8"), prepare=False)
@@ -366,9 +369,14 @@ class WorkflowConcurrencyTests(unittest.TestCase):
             self.incident_id = incident["id"]
 
     # Insert a pending firewall proposal for the current test incident.
-    def _create_recommendation(self, target_value=None):
+    def _create_recommendation(self, target_value=None, triaged=True):
         target_value = target_value or self.target_value
         with self.test_pool.connection() as conn:
+            if triaged:
+                conn.execute(
+                    "UPDATE incidents SET status = 'investigating' WHERE id = %s AND status = 'new'",
+                    (self.incident_id,),
+                )
             row = conn.execute(
                 """
                 INSERT INTO recommendations
@@ -1059,6 +1067,71 @@ class WorkflowConcurrencyTests(unittest.TestCase):
                 "SELECT status FROM recommendations WHERE id = %s", (recommendation_id,)
             ).fetchone()["status"]
         self.assertEqual(status, "pending")
+
+    def test_actions_cannot_be_approved_before_tier1_triage(self):
+        recommendation_id = self._create_recommendation(triaged=False)
+
+        with self.assertRaises(HTTPException) as error:
+            self.recommendations.approve(
+                recommendation_id,
+                self.recommendations.DecisionIn(),
+                {"id": self.user_id, "role": "tier3"},
+            )
+
+        self.assertEqual(error.exception.status_code, 409)
+        self.assertEqual(self._incident_status(), "new")
+
+    def test_triage_records_when_it_happened(self):
+        from app.schemas import TriageIn
+
+        self.incidents.triage_incident(
+            self.incident_id, TriageIn(confirmed=True), {"id": self.user_id, "role": "tier1"}
+        )
+
+        with self.test_pool.connection() as conn:
+            incident = conn.execute(
+                "SELECT triaged_at, created_at FROM incidents WHERE id = %s", (self.incident_id,)
+            ).fetchone()
+        self.assertIsNotNone(incident["triaged_at"])
+        self.assertGreaterEqual(incident["triaged_at"], incident["created_at"])
+
+    def _recommendation_citing(self, alert_ids):
+        return RecommendationIn(
+            incident_id=self.incident_id,
+            action_type="block_ip",
+            executor="firewall",
+            target_scope="single_ip",
+            target_value=self.target_value,
+            reason="Regression test",
+            duration_secs=60,
+            evidence_alert_ids=alert_ids,
+        )
+
+    def test_recommendation_stores_validated_evidence(self):
+        with self.test_pool.connection() as conn:
+            alert_id = conn.execute(
+                "INSERT INTO alerts (incident_id, source) VALUES (%s, 'ids') RETURNING id",
+                (self.incident_id,),
+            ).fetchone()["id"]
+
+        row = self.recommendations.create_recommendation(self._recommendation_citing([alert_id, alert_id]))
+
+        self.assertEqual(row["evidence_alert_ids"], [alert_id])
+
+    def test_recommendation_citing_unrelated_alerts_is_rejected(self):
+        with self.test_pool.connection() as conn:
+            other_incident = conn.execute(
+                "INSERT INTO incidents (title, severity) VALUES ('Other', 3) RETURNING id"
+            ).fetchone()["id"]
+            other_alert = conn.execute(
+                "INSERT INTO alerts (incident_id, source) VALUES (%s, 'ids') RETURNING id",
+                (other_incident,),
+            ).fetchone()["id"]
+
+        for cited in ([other_alert], [999_999_999]):
+            with self.subTest(cited=cited), self.assertRaises(HTTPException) as error:
+                self.recommendations.create_recommendation(self._recommendation_citing(cited))
+            self.assertEqual(error.exception.status_code, 422)
 
     def test_approved_action_moves_escalated_incident_to_in_response(self):
         recommendation_id = self._create_recommendation()

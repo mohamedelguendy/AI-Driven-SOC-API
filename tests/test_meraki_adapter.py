@@ -100,6 +100,7 @@ class MerakiAdapterTests(unittest.TestCase):
             "meraki_api_key": "test-key",
             "meraki_network_ids": "N_1,N_2",
             "meraki_block_inbound": True,
+            "firewall_execution_mode": "live",
             **overrides,
         }
         self.stack.enter_context(patch.multiple(settings, **values))
@@ -180,6 +181,18 @@ class MerakiAdapterTests(unittest.TestCase):
         self.assertIn("not attempted", message)
         self.assertEqual(dashboard.puts, 0)
 
+    def test_dry_run_reads_but_never_writes(self):
+        dashboard = FakeDashboard(["N_1", "N_2"])
+        self.use(dashboard, firewall_execution_mode="dry_run")
+
+        with patch.object(settings, "firewall_mode", "meraki"):
+            success, message = adapters.execute("firewall", self.command)
+
+        self.assertTrue(success, message)
+        self.assertTrue(message.startswith(adapters.DRY_RUN_PREFIX))
+        self.assertEqual(dashboard.puts, 0)
+        self.assertTrue(all(rules == [MANUAL_RULE] for rules in dashboard.rules.values()))
+
     def test_firewall_mode_selects_the_adapter(self):
         self.assertIs(adapters._adapter_for("firewall"), adapters.firewall)
         with patch.object(settings, "firewall_mode", "meraki"):
@@ -196,6 +209,7 @@ class RecommendationTargetTests(unittest.TestCase):
         "target_scope": "single_ip",
         "reason": "Regression test",
         "duration_secs": 60,
+        "evidence_alert_ids": [1],
     }
 
     def test_backend_derives_firewall_target_scope(self):

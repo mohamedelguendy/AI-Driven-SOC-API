@@ -52,6 +52,8 @@ class RecommendationIn(BaseModel):
     duration_secs: int | None = Field(default=None, gt=0)
     reason: str = Field(min_length=1, max_length=10_000)
     risk_score: int | None = Field(default=None, ge=0, le=100)
+    # Alerts the AI cites as evidence; checked against the incident before storing.
+    evidence_alert_ids: list[int] = Field(min_length=1, max_length=100)
 
     @model_validator(mode="after")
     def normalize_firewall_target(self):

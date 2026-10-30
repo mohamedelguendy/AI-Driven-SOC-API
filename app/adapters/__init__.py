@@ -4,6 +4,7 @@ from ..config import settings
 from . import edr, firewall, meraki, secure_firewall
 
 ADAPTERS = {"firewall": firewall, "edr": edr}
+DRY_RUN_PREFIX = "[DRY RUN - no change made] "
 
 
 
@@ -19,19 +20,29 @@ def _adapter_for(executor: str):
 
 
 
+# Run one adapter call, turning crashes into failures and labelling dry runs.
+def _run(executor: str, operation: str, command: dict) -> tuple[bool, str]:
+    adapter = _adapter_for(executor)
+    if adapter is None:
+        return False, f"No adapter configured for executor '{executor}'"
+    try:
+        success, message = getattr(adapter, operation)(command)
+    except Exception as e:  # noqa: BLE001 — any adapter failure must become a logged failure, never a crash
+        return False, f"Adapter error: {e}"
+    if adapter in (secure_firewall, meraki) and settings.firewall_execution_mode == "dry_run":
+        message = DRY_RUN_PREFIX + message
+    return success, message
+
+
+
+
 # Convert adapter errors into failed action results for the durable job worker.
 def execute(executor: str, command: dict) -> tuple[bool, str]:
     """Routes a command to the right adapter's execute(). Never lets an
     adapter crash the request — a broken adapter becomes a failed
     action, not a 500 error.
     """
-    adapter = _adapter_for(executor)
-    if adapter is None:
-        return False, f"No adapter configured for executor '{executor}'"
-    try:
-        return adapter.execute(command)
-    except Exception as e:  # noqa: BLE001 — any adapter failure must become a logged failure, never a crash
-        return False, f"Adapter error: {e}"
+    return _run(executor, "execute", command)
 
 
 
@@ -39,10 +50,4 @@ def execute(executor: str, command: dict) -> tuple[bool, str]:
 # Route reversals through the same provider selected for the original executor.
 def revert(executor: str, command: dict) -> tuple[bool, str]:
     """Routes a command to the right adapter's revert() (unblock / un-isolate)."""
-    adapter = _adapter_for(executor)
-    if adapter is None:
-        return False, f"No adapter configured for executor '{executor}'"
-    try:
-        return adapter.revert(command)
-    except Exception as e:  # noqa: BLE001
-        return False, f"Adapter error: {e}"
+    return _run(executor, "revert", command)

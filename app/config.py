@@ -29,6 +29,9 @@ class Settings(BaseSettings):
     # "fmc" blocks IPs on Cisco Secure Firewall through its management
     # center; "meraki" pushes deny rules to Cisco Meraki MX networks.
     firewall_mode: Literal["simulated", "fmc", "meraki"] = "simulated"
+    # "dry_run" talks to the real FMC/Meraki (login, reads) but never writes;
+    # switch to "live" only when blocks should really be enforced.
+    firewall_execution_mode: Literal["dry_run", "live"] = "dry_run"
     fmc_host: str = ""  # e.g. https://fmc.example.local
     fmc_username: str = ""
     fmc_password: str = ""
@@ -38,7 +41,7 @@ class Settings(BaseSettings):
     meraki_api_key: str | None = None
     meraki_network_ids: str = ""  # comma-separated, e.g. "L_123,N_456"
     meraki_base_url: str = "https://api.meraki.com/api/v1"
-    meraki_block_inbound: bool = False
+    meraki_block_inbound: bool = True  # also block traffic from the attacker, not just to it
 
     @property
     def meraki_network_id_list(self) -> list[str]:

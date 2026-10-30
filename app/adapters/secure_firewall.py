@@ -177,6 +177,8 @@ def _target(command: dict) -> str:
 
 # Build the FMC request body for adding or removing mappings.
 def _change_mapping(object_id: str, operation: str, addresses: list[str]) -> None:
+    if settings.firewall_execution_mode == "dry_run":
+        return  # everything up to the write has run; the firewall stays untouched
     body = {"add": [], "remove": []}
     body[operation] = [{"mappings": addresses, "dynamicObject": {"id": object_id}}]
     _request("POST", "/object/dynamicobjectmappings", body)

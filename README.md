@@ -68,7 +68,9 @@ back-end/
    ```
 4. **Create your `.env`:** copy `.env.example` to `.env` and replace the
    placeholders. `JWT_SECRET`, `INGEST_API_KEY`, and `AI_API_KEY` must each be
-   at least 32 characters; generate separate, unique random values for them.
+   at least 32 characters; generate separate, unique random values for them
+   (run `python -c "import secrets; print(secrets.token_urlsafe(48))"` once per key).
+   The app and the tests both read `.env` on startup, so create it first.
    `JWT_EXPIRE_MINUTES` must be between 1 and 1440. The two threat-intel keys
    are optional. Set `POSTGRES_PASSWORD` and use the same password in
    `DATABASE_URL`; Docker Compose reads it from `.env`. Keep the host as
@@ -82,13 +84,15 @@ back-end/
    ```bash
    Get-Content "back-end schema proto 2.sql" | docker exec -i soc_db psql -U soc -d soc
    ```
-7. **Apply migrations** (after the schema; apply each migration once, in order):
+7. **Apply migrations** (after the schema, in order; 001–003 are already part of
+   the schema file, so start at 004. Each one is safe to re-run):
    ```bash
    Get-Content migration/004_add_threat_intel.sql | docker exec -i soc_db psql -U soc -d soc
    Get-Content migration/005_action_jobs.sql | docker exec -i soc_db psql -U soc -d soc
    Get-Content migration/006_login_rate_limits.sql | docker exec -i soc_db psql -U soc -d soc
    Get-Content migration/007_alert_ingest_idempotency.sql | docker exec -i soc_db psql -U soc -d soc
    Get-Content migration/008_action_job_leases.sql | docker exec -i soc_db psql -U soc -d soc
+   Get-Content migration/009_evidence_and_triage_time.sql | docker exec -i soc_db psql -U soc -d soc
    ```
 8. **Create a user:**
    ```bash
@@ -131,9 +135,9 @@ limits an IP/username pair to 10 attempts per 15-minute window.
 | `POST /incidents/{id}/triage` | Tier1 confirms or dismisses a new incident |
 | `POST /analysis/classify` | Rule-based severity/priority suggestion for tier1 |
 | `GET /threat-intel/{ip}` | IP reputation (AbuseIPDB / VirusTotal), cached 1 hour |
-| `POST /recommendations` | AI submits a recommendation (needs `X-API-Key`: `AI_API_KEY`) |
+| `POST /recommendations` | AI submits a recommendation (needs `X-API-Key`: `AI_API_KEY`); `evidence_alert_ids` must name alerts of that incident, or it's rejected with 422 |
 | `POST /analysis/validate-evidence` | Confirms an AI report's cited alert IDs are real |
-| `POST /recommendations/{id}/approve` | Tier2 (low-impact) / tier3 (any) approve and queue execution; identical pending actions return 409 |
+| `POST /recommendations/{id}/approve` | Tier2 (low-impact) / tier3 (any) approve and queue execution. Returns 409 if tier1 hasn't triaged the incident yet, or if an identical action is already pending |
 | `POST /actions/{id}/revert` | Queue a manual reversal or retry a failed reversal |
 | `GET /actions?active_only=true` | Successfully applied actions still in effect |
 
@@ -164,6 +168,22 @@ them with the comma-separated `INTERNAL_NETWORK_CIDRS` setting.
 `ingest_ids_engine.py` together if the IDS engine is also processing
 Suricata's own events — that double-ingests Suricata alerts. See the
 docstring in `ingest_ids_engine.py`.
+
+## Dry run vs live
+
+With `FIREWALL_MODE=fmc` or `meraki`, `FIREWALL_EXECUTION_MODE` decides whether
+blocks are really enforced:
+
+- `dry_run` (default): logs in and reads the firewall's current state, so it
+  proves credentials and setup work, but skips every write. Action results
+  start with `[DRY RUN - no change made]`.
+- `live`: blocks and unblocks for real.
+
+## Metrics
+
+Incidents store `created_at`, `triaged_at` (set when tier1 confirms or
+dismisses) and `resolved_at`. MTTA = `triaged_at - created_at`;
+MTTR = `resolved_at - created_at`.
 
 ## Cisco Secure Firewall
 
@@ -204,7 +224,7 @@ appliances through the Dashboard API instead of simulating them:
 |---|---|
 | `MERAKI_API_KEY` | Dashboard API key of an account with write access to the networks below |
 | `MERAKI_NETWORK_IDS` | Comma-separated network IDs that blocks are applied to |
-| `MERAKI_BLOCK_INBOUND` | `true` also adds deny rules to the MX inbound firewall rules |
+| `MERAKI_BLOCK_INBOUND` | `true` (default) also adds deny rules to the MX inbound firewall rules, blocking traffic from the attacker as well as to it |
 
 Supported firewall actions (any other `action_type` is rejected with 422):
 
@@ -228,7 +248,8 @@ moment can still be overwritten. Try it on a test network first.
 
 EDR execution is currently simulated (logged, not sent to a real device)
 — pending access details from the security team. Firewall execution is
-simulated unless `FIREWALL_MODE` is `fmc` or `meraki`. Approvals and
+simulated unless `FIREWALL_MODE` is `fmc` or `meraki`, and even then only
+enforced when `FIREWALL_EXECUTION_MODE=live`. Approvals and
 reversions are durable queued jobs; the worker retries failures up to eight
 times with exponential backoff and renews its database lease while an adapter
 call is active. A failed reversal can be retried by calling the same revert

@@ -135,6 +135,9 @@ def _update_rules(network_id: str, ruleset: str, change) -> None:
         if updated is None:
             return
 
+        if settings.firewall_execution_mode == "dry_run":
+            return  # everything up to the write has run; the firewall stays untouched
+
         body = {"rules": updated}
         if "syslogDefaultRule" in current:
             body["syslogDefaultRule"] = current["syslogDefaultRule"]
